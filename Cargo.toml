@@ -46,6 +46,12 @@ plist = "1"
 icns = "0.3"
 png = "0.18"
 libc = "0.2"
+# Re-posting system media keys (exclusive mode) and the Accessibility check.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSEvent", "NSGraphicsContext", "objc2-core-graphics"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGEvent", "CGEventTypes"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry"] }
+core-foundation = "0.10"
 
 [build-dependencies]
 winres = "0.1"

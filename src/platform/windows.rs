@@ -218,6 +218,14 @@ pub fn supported_buttons() -> &'static [crate::config::Button] {
     &[crate::config::Button::Teams]
 }
 
+pub fn supports_media_key_takeover() -> bool {
+    false
+}
+
+pub fn accessibility_trusted(_prompt: bool) -> bool {
+    true
+}
+
 pub fn autostart_enabled() -> bool {
     let sub = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
     let value = wide("MsAudioDockRemapper");

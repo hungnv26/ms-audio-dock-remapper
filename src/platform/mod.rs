@@ -86,6 +86,9 @@ pub enum MonitorEvent {
     /// Tray / status-item menu requested a full exit (macOS menu bar item).
     #[cfg_attr(windows, allow(dead_code))]
     Quit,
+    /// The Dock is now open exclusively (true) or shared (false); macOS only.
+    #[cfg_attr(windows, allow(dead_code))]
+    Exclusive(bool),
 }
 
 /// Starts the OS-specific resident monitor (input listening + tray).
@@ -136,6 +139,19 @@ pub fn set_dpi_aware() {
 /// Teams collection with Raw Input; macOS reads the whole interface.
 pub fn supported_buttons() -> &'static [Button] {
     backend::supported_buttons()
+}
+
+/// Whether this backend can take the Dock's media keys away from the system
+/// (macOS exclusive open + re-posting). False elsewhere.
+pub fn supports_media_key_takeover() -> bool {
+    backend::supports_media_key_takeover()
+}
+
+/// Whether the process may synthesize system input (macOS Accessibility
+/// trust). With `prompt`, the OS asks the user to grant it. Always true where
+/// no such gate exists.
+pub fn accessibility_trusted(prompt: bool) -> bool {
+    backend::accessibility_trusted(prompt)
 }
 
 /// Whether a login entry for this app currently exists.

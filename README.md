@@ -112,6 +112,13 @@ The **General** section offers:
   configuration file cannot be read. You can pass `--minimized` to a shortcut
   of your own for the same effect.
 
+On macOS, giving Play/Pause or a Volume key an action makes the app take the
+Dock over from the system, so the key does only your action; keys without an
+action are re-posted to the system and keep working (a held volume key no
+longer auto-repeats). Re-posting needs Accessibility access: macOS asks for it
+the first time you bind a media key, and until it is granted the system keeps
+performing the key's own function as well.
+
 Only one instance of the application can run at a time.
 
 ## Configuration
@@ -142,8 +149,11 @@ Copy the bundle to `/Applications` and open it. The app shows a menu bar icon
 (no Dock icon); use its menu to open the settings window or quit. "Launch at
 login" writes a per-user LaunchAgent under `~/Library/LaunchAgents/`.
 
-No Input Monitoring or Accessibility permission is required: the Dock's Teams
-key lives in a vendor HID collection that macOS leaves open to applications.
+No Input Monitoring or Accessibility permission is required for the default
+shared mode: the Dock's Teams key lives in a vendor HID collection that macOS
+leaves open to applications. Only binding a media key asks for Accessibility
+access, because the app then has to re-post the system media keys it
+intercepts.
 
 ## Development
 

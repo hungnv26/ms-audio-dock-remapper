@@ -48,6 +48,14 @@ impl Button {
         Button::MicMute,
     ];
 
+    /// Keys the OS also acts on. Binding one of them makes the macOS backend
+    /// take the Dock over so only the bound action runs.
+    pub const MEDIA: [Button; 3] = [Button::PlayPause, Button::VolumeUp, Button::VolumeDown];
+
+    pub fn is_media(self) -> bool {
+        Self::MEDIA.contains(&self)
+    }
+
     /// User-facing name.
     pub fn label(self) -> &'static str {
         match self {

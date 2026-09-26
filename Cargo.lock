@@ -3005,10 +3005,15 @@ name = "ms-audio-dock-remapper"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "core-foundation 0.10.1",
  "dirs 5.0.1",
  "hidapi",
  "icns",
  "libc",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-graphics",
+ "objc2-foundation 0.3.2",
  "open",
  "plist",
  "png 0.18.1",

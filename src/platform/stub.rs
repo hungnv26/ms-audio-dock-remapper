@@ -35,6 +35,14 @@ pub fn supported_buttons() -> &'static [Button] {
     &Button::ALL
 }
 
+pub fn supports_media_key_takeover() -> bool {
+    false
+}
+
+pub fn accessibility_trusted(_prompt: bool) -> bool {
+    true
+}
+
 pub fn autostart_enabled() -> bool {
     false
 }

@@ -241,6 +241,12 @@ slint::slint! {
         in-out property <bool> launch-at-login: false;
         in-out property <bool> start-hidden: false;
         in property <string> start-hidden-hint;
+        in property <bool> media-takeover-available: false;
+        in property <string> accessibility-text;
+        in property <bool> accessibility-granted: false;
+        in property <bool> exclusive-active: false;
+        // A media key has an action but the takeover is not active yet.
+        in property <bool> needs-accessibility: false;
 
         callback button-selected(int);
         callback action-kind-changed(int);
@@ -250,6 +256,7 @@ slint::slint! {
         callback arguments-changed(string);
         callback test-action();
         callback setting-changed();
+        callback open-accessibility-settings();
         callback open-repo();
         callback quit-app();
 
@@ -446,6 +453,17 @@ slint::slint! {
                                 }
                             }
                         }
+                        if root.needs-accessibility: Group {
+                            Row {
+                                label: "Accessibility access needed";
+                                detail: "Until Audio Dock Remapper is allowed under Privacy & Security › Accessibility, macOS also performs this key's system function. The app switches over by itself once allowed.";
+                                divider: false;
+                                Button {
+                                    text: "Open System Settings";
+                                    clicked => { root.open-accessibility-settings(); }
+                                }
+                            }
+                        }
                         Caption { text: root.media-hint; }
                     }
 
@@ -489,6 +507,19 @@ slint::slint! {
                                 Switch {
                                     checked <=> root.start-hidden;
                                     toggled => { root.setting-changed(); }
+                                }
+                            }
+                        }
+                        if root.media-takeover-available: Group {
+                            title: "Media keys";
+                            Row {
+                                label: "Accessibility access";
+                                detail: root.accessibility-text;
+                                divider: false;
+                                Button {
+                                    text: "Open System Settings";
+                                    visible: !root.accessibility-granted;
+                                    clicked => { root.open-accessibility-settings(); }
                                 }
                             }
                         }
@@ -558,6 +589,9 @@ slint::slint! {
 
 const REPO_URL: &str = "https://github.com/Masterain98/ms-audio-dock-remapper";
 
+const ACCESSIBILITY_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+
 /// Everything the callbacks need, shared through `Rc`.
 struct State {
     config: Arc<Mutex<Config>>,
@@ -566,6 +600,8 @@ struct State {
     filtered: RefCell<Vec<usize>>,
     buttons: &'static [DockButton],
     selected: Cell<usize>,
+    /// The Accessibility dialog is raised at most once per session.
+    prompted: Cell<bool>,
     button_model: Rc<VecModel<ButtonEntry>>,
     app_model: Rc<VecModel<AppEntry>>,
 }
@@ -584,14 +620,55 @@ impl State {
         }
     }
 
-    /// Rewrites the summary column of every button row in place.
-    fn refresh_buttons(&self) {
+    /// Rewrites the summary column of every button row in place and the
+    /// media-key caption under the list.
+    fn refresh_buttons(&self, ui: &AppWindow) {
         let cfg = self.config.lock().unwrap();
         for (i, button) in self.buttons.iter().enumerate() {
             if let Some(mut entry) = self.button_model.row_data(i) {
                 entry.summary = cfg.buttons.get(*button).summary().into();
                 self.button_model.set_row_data(i, entry);
             }
+        }
+        let media_bound = DockButton::MEDIA
+            .iter()
+            .any(|b| cfg.buttons.get(*b).kind != ActionKind::None);
+        drop(cfg);
+        let exclusive = ui.get_exclusive_active();
+        let granted = ui.get_accessibility_granted();
+        let takeover = platform::supports_media_key_takeover();
+        ui.set_needs_accessibility(takeover && media_bound && !granted);
+        ui.set_media_hint(media_hint(media_bound, exclusive, granted).into());
+    }
+
+    /// Re-reads Accessibility trust and updates the texts that show it.
+    fn refresh_accessibility(&self, ui: &AppWindow) {
+        let granted = platform::accessibility_trusted(false);
+        ui.set_accessibility_granted(granted);
+        ui.set_accessibility_text(
+            if granted {
+                "Granted. A remapped media key does only your action."
+            } else {
+                "Needed so a remapped Play/Pause or Volume key stops reaching the system. Allow Audio Dock Remapper under Privacy & Security › Accessibility."
+            }
+            .into(),
+        );
+    }
+
+    /// Raises the system Accessibility dialog (once per session) when a media
+    /// key just received an action and the takeover cannot start without it.
+    fn ensure_accessibility(&self, ui: &AppWindow) {
+        if !platform::supports_media_key_takeover() || self.prompted.get() {
+            return;
+        }
+        let bound = {
+            let cfg = self.config.lock().unwrap();
+            cfg.buttons.get(self.current()).kind != ActionKind::None
+        };
+        if bound && self.current().is_media() && !ui.get_accessibility_granted() {
+            self.prompted.set(true);
+            platform::accessibility_trusted(true);
+            self.refresh_accessibility(ui);
         }
     }
 
@@ -607,6 +684,7 @@ impl State {
         ui.set_arguments(action.arguments.into());
         ui.set_app_filter("".into());
         self.rebuild_apps(ui, "");
+        self.ensure_accessibility(ui);
     }
 
     /// Filters the picker by `query` and highlights the bound app, if listed.
@@ -683,7 +761,6 @@ pub fn run(config: Arc<Mutex<Config>>, start_minimized: bool) {
         }
     }
     ui.set_version(env!("CARGO_PKG_VERSION").into());
-    ui.set_media_hint(media_hint().into());
     ui.set_start_hidden_hint(start_hidden_hint().into());
     {
         let cfg = config.lock().unwrap();
@@ -702,6 +779,8 @@ pub fn run(config: Arc<Mutex<Config>>, start_minimized: bool) {
         ui.set_start_hidden(cfg.settings.start_hidden);
     }
     ui.set_launch_at_login(autostart::is_enabled());
+    ui.set_media_takeover_available(platform::supports_media_key_takeover());
+    ui.window().set_size(slint::LogicalSize::new(780.0, 820.0));
 
     let buttons = platform::supported_buttons();
     let button_model = Rc::new(VecModel::from(
@@ -725,10 +804,12 @@ pub fn run(config: Arc<Mutex<Config>>, start_minimized: bool) {
         filtered: RefCell::new(Vec::new()),
         buttons,
         selected: Cell::new(0),
+        prompted: Cell::new(false),
         button_model,
         app_model,
     });
-    state.refresh_buttons();
+    state.refresh_accessibility(&ui);
+    state.refresh_buttons(&ui);
     state.refresh_detail(&ui);
 
     // ---- callbacks ----------------------------------------------------------
@@ -752,9 +833,10 @@ pub fn run(config: Arc<Mutex<Config>>, start_minimized: bool) {
             let button = st.current();
             st.config.lock().unwrap().buttons.get_mut(button).kind = kind;
             st.save();
-            st.refresh_buttons();
             if let Some(ui) = uiw.upgrade() {
+                st.refresh_buttons(&ui);
                 st.rebuild_apps(&ui, ui.get_app_filter().as_str());
+                st.ensure_accessibility(&ui);
             }
         });
     }
@@ -791,14 +873,16 @@ pub fn run(config: Arc<Mutex<Config>>, start_minimized: bool) {
                 action.app_target = app.target;
             }
             st.save();
-            st.refresh_buttons();
             if let Some(ui) = uiw.upgrade() {
+                st.refresh_buttons(&ui);
                 ui.set_selected_app(index as i32);
+                st.ensure_accessibility(&ui);
             }
         });
     }
     {
         let st = state.clone();
+        let uiw = ui.as_weak();
         ui.on_command_changed(move |text| {
             st.config
                 .lock()
@@ -807,7 +891,9 @@ pub fn run(config: Arc<Mutex<Config>>, start_minimized: bool) {
                 .get_mut(st.current())
                 .command = text.to_string();
             st.save();
-            st.refresh_buttons();
+            if let Some(ui) = uiw.upgrade() {
+                st.refresh_buttons(&ui);
+            }
         });
     }
     {
@@ -853,6 +939,9 @@ pub fn run(config: Arc<Mutex<Config>>, start_minimized: bool) {
             st.save();
         });
     }
+    ui.on_open_accessibility_settings(|| {
+        let _ = open::that_detached(ACCESSIBILITY_SETTINGS_URL);
+    });
     ui.on_open_repo(|| {
         let _ = open::that_detached(REPO_URL);
     });
@@ -879,6 +968,9 @@ pub fn run(config: Arc<Mutex<Config>>, start_minimized: bool) {
     let (tx, rx) = mpsc::channel::<MonitorEvent>();
     let rx = Arc::new(Mutex::new(rx));
     let ui_weak = ui.as_weak();
+    // The pump runs on the UI thread, so it may hold the (non-Send) state; it
+    // is parked in a thread-local slot for the Send closure to reach it.
+    PUMP_STATE.with(|slot| *slot.borrow_mut() = Some(state.clone()));
     let on_event = {
         let rx = rx.clone();
         let ui_weak = ui_weak.clone();
@@ -911,12 +1003,24 @@ pub fn run(config: Arc<Mutex<Config>>, start_minimized: bool) {
     }
 }
 
-fn media_hint() -> &'static str {
-    if platform::supported_buttons().len() > 1 {
-        "The system keeps its built-in behavior for the media keys; your action runs in addition. \
-         The Teams key is ignored by the system, which makes it the natural one to remap."
-    } else {
+thread_local! {
+    static PUMP_STATE: RefCell<Option<Rc<State>>> = const { RefCell::new(None) };
+}
+
+fn media_hint(media_bound: bool, exclusive: bool, granted: bool) -> &'static str {
+    if platform::supported_buttons().len() <= 1 {
         "On Windows only the Teams key can be observed by this app."
+    } else if exclusive {
+        "Remapped media keys do only your action; the others keep their system role through the app. \
+         Holding a volume key no longer repeats."
+    } else if media_bound && granted {
+        "Taking the media keys over from the system…"
+    } else if media_bound {
+        "Play/Pause and Volume actions currently run in addition to the system's own handling of \
+         those keys, until Accessibility access is granted."
+    } else {
+        "The Teams key is ignored by the system, which makes it the natural one to remap. Media keys \
+         keep their system role until you give them an action."
     }
 }
 
@@ -1017,6 +1121,15 @@ fn apply_event(ui: &AppWindow, ev: MonitorEvent) {
             ui.set_connected(n > 0);
             ui.set_status_text(if n > 0 { "Connected" } else { "Not connected" }.into());
             ui.set_collections_text(n.to_string().into());
+        }
+        MonitorEvent::Exclusive(exclusive) => {
+            ui.set_exclusive_active(exclusive);
+            PUMP_STATE.with(|slot| {
+                if let Some(state) = slot.borrow().as_ref() {
+                    state.refresh_accessibility(ui);
+                    state.refresh_buttons(ui);
+                }
+            });
         }
         MonitorEvent::TrayShow => {
             let _ = ui.show();

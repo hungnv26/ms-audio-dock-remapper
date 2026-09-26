@@ -18,6 +18,7 @@
 //! The Teams report is byte-identical to what the Windows backend sees.
 
 use std::cell::RefCell;
+use std::ffi::c_int;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -32,8 +33,13 @@ use hidapi::{DeviceInfo, HidApi, HidDevice};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
+use core_foundation::base::TCFType;
+use core_foundation::boolean::CFBoolean;
+use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+use core_foundation::string::CFString;
+
 use crate::autostart::MINIMIZED_FLAG;
-use crate::config::{Button, Config, DeviceFilter};
+use crate::config::{ActionKind, Button, Config, DeviceFilter};
 use crate::i18n;
 use crate::platform::MonitorEvent;
 
@@ -52,6 +58,35 @@ const RESCAN_INTERVAL: Duration = Duration::from_secs(1);
 const READ_TIMEOUT_MS: i32 = 250;
 /// launchd label of the login item written by [`set_autostart`].
 const LAUNCH_AGENT_LABEL: &str = "com.masterain.ms-audio-dock-remapper";
+/// How many read timeouts pass between checks of the desired open mode.
+const MODE_CHECK_TICKS: u32 = 4;
+
+// NX_KEYTYPE_* codes of the system-defined media key events.
+const NX_KEYTYPE_SOUND_UP: isize = 0;
+const NX_KEYTYPE_SOUND_DOWN: isize = 1;
+const NX_KEYTYPE_PLAY: isize = 16;
+
+extern "C" {
+    // From the hidapi C library the `hidapi` crate links statically. Selects
+    // whether the next open seizes the device (1) or shares it (0).
+    fn hid_darwin_set_open_exclusive(open_exclusive: c_int);
+}
+
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXIsProcessTrusted() -> u8;
+    fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> u8;
+}
+
+/// How the Dock's HID interface is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    /// macOS keeps receiving every report; media keys keep their system role.
+    Shared,
+    /// Only this app receives reports; keys without an action are re-posted
+    /// as system media keys (needs Accessibility trust).
+    Exclusive,
+}
 
 /// The UI-provided event sink, shared between the monitor thread and the
 /// main-thread menu handler. The `Mutex` is what makes the `Send`-only
@@ -74,6 +109,81 @@ fn emit(on_event: &SharedOnEvent, event: MonitorEvent) {
 /// Every Dock button is visible on the shared interface.
 pub fn supported_buttons() -> &'static [Button] {
     &Button::ALL
+}
+
+pub fn supports_media_key_takeover() -> bool {
+    true
+}
+
+/// Accessibility trust, which gates `CGEventPost` (verified: from an untrusted
+/// process the post is silently dropped). With `prompt`, macOS shows its
+/// "would like to control this computer" dialog and adds the app to the list.
+pub fn accessibility_trusted(prompt: bool) -> bool {
+    if !prompt {
+        return unsafe { AXIsProcessTrusted() } != 0;
+    }
+    let options = CFDictionary::from_CFType_pairs(&[(
+        CFString::new("AXTrustedCheckOptionPrompt").as_CFType(),
+        CFBoolean::true_value().as_CFType(),
+    )]);
+    unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) != 0 }
+}
+
+/// Exclusive as soon as a media key has an action (so the system stops acting
+/// on it too) *and* the re-post path works; otherwise a seized Dock would
+/// leave the volume keys dead.
+fn desired_mode(config: &Arc<Mutex<Config>>) -> OpenMode {
+    let wanted = {
+        let cfg = config.lock().unwrap();
+        cfg.settings.enabled
+            && Button::MEDIA
+                .iter()
+                .any(|b| cfg.buttons.get(*b).kind != ActionKind::None)
+    };
+    if wanted && accessibility_trusted(false) {
+        OpenMode::Exclusive
+    } else {
+        OpenMode::Shared
+    }
+}
+
+/// Synthesizes one press+release of a system media key, the same way the HID
+/// event driver would have reported the Dock's own key.
+fn post_media_key(key: isize) {
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+    use objc2_core_graphics::{CGEvent, CGEventTapLocation};
+    use objc2_foundation::NSPoint;
+
+    for down in [true, false] {
+        let flags = NSEventModifierFlags(if down { 0xa00 } else { 0xb00 });
+        let data1 = (key << 16) | (if down { 0xa } else { 0xb } << 8);
+        let event = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+            NSEventType::SystemDefined,
+            NSPoint::new(0.0, 0.0),
+            flags,
+            0.0,
+            0,
+            None,
+            8,
+            data1,
+            -1,
+        );
+        if let Some(cg_event) = event.and_then(|e| e.CGEvent()) {
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&cg_event));
+        }
+    }
+}
+
+/// What the system would have done with the key: re-posted in exclusive mode
+/// when the button has no action. Teams is ignored by macOS anyway, and mic
+/// mute is handled inside the Dock's firmware.
+fn forward_system_key(button: Button) {
+    match button {
+        Button::VolumeUp => post_media_key(NX_KEYTYPE_SOUND_UP),
+        Button::VolumeDown => post_media_key(NX_KEYTYPE_SOUND_DOWN),
+        Button::PlayPause => post_media_key(NX_KEYTYPE_PLAY),
+        Button::Teams | Button::MicMute => {}
+    }
 }
 
 /// Starts the resident monitor: the menu bar item (main thread), the action
@@ -146,11 +256,18 @@ fn monitor_loop(
             sleep_unless_quit(RESCAN_INTERVAL);
             continue;
         };
+        let mode = desired_mode(&config);
+        unsafe { hid_darwin_set_open_exclusive((mode == OpenMode::Exclusive) as c_int) };
         let Ok(device) = api.open_path(&path) else {
             sleep_unless_quit(RESCAN_INTERVAL);
             continue;
         };
-        read_reports(&device, &on_event, &config, &action_tx);
+        eprintln!("[ms-audio-dock-remapper] Dock opened in {mode:?} mode");
+        emit(
+            &on_event,
+            MonitorEvent::Exclusive(mode == OpenMode::Exclusive),
+        );
+        read_reports(&device, mode, &on_event, &config, &action_tx);
     }
 }
 
@@ -173,25 +290,36 @@ fn matches_filter(device: &DeviceInfo, filter: &DeviceFilter) -> bool {
     }
 }
 
-/// Blocks on the device until it disappears or a quit is requested.
+/// Blocks on the device until it disappears, the desired open mode changes
+/// (the caller then reopens) or a quit is requested.
 fn read_reports(
     device: &HidDevice,
+    mode: OpenMode,
     on_event: &SharedOnEvent,
     config: &Arc<Mutex<Config>>,
     action_tx: &Sender<(Button, Config)>,
 ) {
     let mut buf = [0u8; 64];
+    let mut ticks = 0u32;
     while !QUIT.load(Ordering::SeqCst) {
         match device.read_timeout(&mut buf, READ_TIMEOUT_MS) {
-            Ok(0) => {}
+            Ok(0) => {
+                ticks += 1;
+                if ticks.is_multiple_of(MODE_CHECK_TICKS) && desired_mode(config) != mode {
+                    return;
+                }
+            }
             Ok(n) => {
                 if let Some(button) = match_press(&buf[..n]) {
                     emit(on_event, MonitorEvent::Press(button));
                     // Clone, then release the lock before handing the action
                     // to the worker; never hold the config mutex across a launch.
                     let cfg = config.lock().unwrap().clone();
-                    if cfg.settings.enabled {
+                    let has_action = cfg.buttons.get(button).kind != ActionKind::None;
+                    if cfg.settings.enabled && has_action {
                         let _ = action_tx.send((button, cfg));
+                    } else if mode == OpenMode::Exclusive {
+                        forward_system_key(button);
                     }
                 }
             }
