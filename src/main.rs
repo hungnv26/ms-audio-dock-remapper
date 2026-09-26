@@ -26,9 +26,8 @@ fn main() {
     let start_minimized =
         config.lock().unwrap().settings.minimize_to_tray || autostart::started_minimized();
 
-    // Single running instance (named mutex on Windows).
-    #[cfg(windows)]
-    if !platform::windows::ensure_single_instance() {
+    // Single running instance (named mutex on Windows, flock on macOS).
+    if !platform::ensure_single_instance() {
         platform::alert(i18n::t(lang, "single_instance"));
         return;
     }

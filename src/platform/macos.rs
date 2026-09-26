@@ -1,0 +1,407 @@
+//! macOS backend: read-only HID monitoring (IOKit through `hidapi`, opened in
+//! shared mode so macOS keeps handling the Dock's own volume / media keys), a
+//! menu bar status item, LaunchAgent login autostart and a single-instance
+//! file lock.
+//!
+//! macOS exposes the whole Dock HID interface through one device handle rather
+//! than one handle per top-level collection as Windows does, so the Teams key
+//! is recognised by its report ID (0x9B) instead of by usage page. The report
+//! layout itself is identical to Windows: `9B 01` on press, `9B 00` on release
+//! (verified against a real Dock, VID 045E / PID 084D, on macOS 26).
+
+use std::cell::RefCell;
+use std::fs::{self, File, OpenOptions};
+use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use hidapi::{DeviceInfo, HidApi, HidDevice};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+
+use crate::autostart::MINIMIZED_FLAG;
+use crate::config::{Config, DeviceFilter};
+use crate::i18n::{self, Lang};
+use crate::platform::MonitorEvent;
+
+/// Report ID of the Teams-key input report inside the Dock's vendor collection
+/// (usage page FF99, usage 0001).
+const TEAMS_REPORT_ID: u8 = 0x9B;
+/// How often the monitor re-scans for the Dock while it is unplugged.
+const RESCAN_INTERVAL: Duration = Duration::from_secs(1);
+/// Read timeout: bounds how long a quit request waits for the read loop.
+const READ_TIMEOUT_MS: i32 = 250;
+/// launchd label of the login item written by [`set_autostart`].
+const LAUNCH_AGENT_LABEL: &str = "com.masterain.ms-audio-dock-remapper";
+
+/// The UI-provided event sink, shared between the monitor thread and the
+/// main-thread menu handler. The `Mutex` is what makes the `Send`-only
+/// callback usable from both.
+type SharedOnEvent = Arc<Mutex<Box<dyn Fn(MonitorEvent) + Send + 'static>>>;
+
+static QUIT: AtomicBool = AtomicBool::new(false);
+static INSTANCE_LOCK: Mutex<Option<File>> = Mutex::new(None);
+
+thread_local! {
+    // `TrayIcon` is main-thread only; dropping it removes the status item.
+    static STATUS_ITEM: RefCell<Option<TrayIcon>> = const { RefCell::new(None) };
+}
+
+fn emit(on_event: &SharedOnEvent, event: MonitorEvent) {
+    let callback = on_event.lock().unwrap();
+    (*callback)(event);
+}
+
+fn lang_of(config: &Arc<Mutex<Config>>) -> Lang {
+    Lang::resolve(&config.lock().unwrap().language)
+}
+
+/// Starts the resident monitor: the menu bar item (main thread), the action
+/// worker and the HID read loop. Called from `ui::run` on the main thread
+/// before the Slint event loop starts; NSApplication's run loop, driven by
+/// Slint's winit backend, then dispatches the status item's menu actions.
+pub fn start_monitor(
+    on_event: impl Fn(MonitorEvent) + Send + 'static,
+    config: Arc<Mutex<Config>>,
+) {
+    QUIT.store(false, Ordering::SeqCst);
+    let on_event: SharedOnEvent = Arc::new(Mutex::new(Box::new(on_event)));
+
+    install_status_item(on_event.clone(), &config);
+
+    // Actions run off the monitor thread so a slow launch never delays the
+    // next report, mirroring the Windows backend.
+    let (action_tx, action_rx) = mpsc::channel::<Config>();
+    thread::spawn(move || {
+        while let Ok(cfg) = action_rx.recv() {
+            if let Err(e) = crate::actions::execute(&cfg) {
+                let lang = Lang::resolve(&cfg.language);
+                alert(&format!("{} {e}", i18n::t(lang, "action_fail")));
+            }
+        }
+    });
+
+    let monitor_events = on_event.clone();
+    let spawned = thread::Builder::new()
+        .name("dock-monitor".into())
+        .spawn(move || monitor_loop(monitor_events, config, action_tx));
+    if spawned.is_err() {
+        emit(&on_event, MonitorEvent::Status(0));
+    }
+}
+
+/// Re-scans for the Dock, reads it until it goes away, repeats. Hot-plug is
+/// handled by the outer loop: a read error means the device was removed.
+fn monitor_loop(on_event: SharedOnEvent, config: Arc<Mutex<Config>>, action_tx: Sender<Config>) {
+    let mut api = match HidApi::new() {
+        Ok(api) => api,
+        Err(e) => {
+            alert(&format!("{} {e}", i18n::t(lang_of(&config), "init_fail")));
+            emit(&on_event, MonitorEvent::Status(0));
+            return;
+        }
+    };
+
+    let mut last_status: Option<u32> = None;
+    while !QUIT.load(Ordering::SeqCst) {
+        let filter = config.lock().unwrap().device.clone();
+        let path = match api.refresh_devices() {
+            Ok(()) => {
+                let matching: Vec<&DeviceInfo> = api
+                    .device_list()
+                    .filter(|d| matches_filter(d, &filter))
+                    .collect();
+                let count = matching.len() as u32;
+                if last_status != Some(count) {
+                    emit(&on_event, MonitorEvent::Status(count));
+                    last_status = Some(count);
+                }
+                matching.first().map(|d| d.path().to_owned())
+            }
+            Err(_) => None,
+        };
+
+        let Some(path) = path else {
+            sleep_unless_quit(RESCAN_INTERVAL);
+            continue;
+        };
+        let Ok(device) = api.open_path(&path) else {
+            sleep_unless_quit(RESCAN_INTERVAL);
+            continue;
+        };
+        read_reports(&device, &on_event, &config, &action_tx);
+    }
+}
+
+/// True when this enumerated collection is the one the config points at.
+fn matches_filter(device: &DeviceInfo, filter: &DeviceFilter) -> bool {
+    let hex = |s: &str| u16::from_str_radix(s.trim(), 16).ok();
+    match (
+        hex(&filter.vendor_id),
+        hex(&filter.product_id),
+        hex(&filter.usage_page),
+        hex(&filter.usage),
+    ) {
+        (Some(vid), Some(pid), Some(usage_page), Some(usage)) => {
+            device.vendor_id() == vid
+                && device.product_id() == pid
+                && device.usage_page() == usage_page
+                && device.usage() == usage
+        }
+        _ => false,
+    }
+}
+
+/// Blocks on the device until it disappears or a quit is requested.
+fn read_reports(
+    device: &HidDevice,
+    on_event: &SharedOnEvent,
+    config: &Arc<Mutex<Config>>,
+    action_tx: &Sender<Config>,
+) {
+    let mut buf = [0u8; 64];
+    while !QUIT.load(Ordering::SeqCst) {
+        match device.read_timeout(&mut buf, READ_TIMEOUT_MS) {
+            Ok(0) => {}
+            Ok(n) => {
+                if let Some(false) = match_teams(&buf[..n]) {
+                    emit(on_event, MonitorEvent::Press);
+                    // Clone, then release the lock before handing the action
+                    // to the worker; never hold the config mutex across a launch.
+                    let cfg = config.lock().unwrap().clone();
+                    if cfg.settings.enabled {
+                        let _ = action_tx.send(cfg);
+                    }
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// Returns `Some(is_release)` for a Teams-key report, `None` for any other
+/// report the shared interface delivers (volume, media, telephony, ...).
+fn match_teams(report: &[u8]) -> Option<bool> {
+    if report.len() < 2 || report[0] != TEAMS_REPORT_ID {
+        return None;
+    }
+    match report[1] {
+        0x01 => Some(false),
+        0x00 => Some(true),
+        _ => None,
+    }
+}
+
+fn sleep_unless_quit(total: Duration) {
+    let step = Duration::from_millis(100);
+    let mut slept = Duration::ZERO;
+    while slept < total && !QUIT.load(Ordering::SeqCst) {
+        thread::sleep(step);
+        slept += step;
+    }
+}
+
+// --- menu bar status item ----------------------------------------------------
+
+fn install_status_item(on_event: SharedOnEvent, config: &Arc<Mutex<Config>>) {
+    let lang = lang_of(config);
+    let menu = Menu::new();
+    let open_item = MenuItem::new(i18n::t(lang, "tray_open"), true, None);
+    let quit_item = MenuItem::new(i18n::t(lang, "menu_exit"), true, None);
+    if let Err(e) = menu.append_items(&[&open_item, &PredefinedMenuItem::separator(), &quit_item]) {
+        eprintln!("[ms-audio-dock-remapper] status menu unavailable: {e}");
+        return;
+    }
+
+    let open_id = open_item.id().clone();
+    let quit_id = quit_item.id().clone();
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        let mapped = if *event.id() == open_id {
+            MonitorEvent::TrayShow
+        } else if *event.id() == quit_id {
+            MonitorEvent::Quit
+        } else {
+            return;
+        };
+        emit(&on_event, mapped);
+    }));
+
+    let mut builder = TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("Microsoft Audio Dock Remapper");
+    if let Some(icon) = status_icon() {
+        builder = builder.with_icon(icon);
+    }
+    match builder.build() {
+        Ok(item) => {
+            eprintln!("[ms-audio-dock-remapper] menu bar item installed");
+            STATUS_ITEM.with(|slot| *slot.borrow_mut() = Some(item));
+        }
+        Err(e) => eprintln!("[ms-audio-dock-remapper] status item unavailable: {e}"),
+    }
+}
+
+/// Decodes the embedded 64px header PNG into a status-bar icon. `None` (and
+/// therefore the default icon) if the asset ever stops being 8-bit RGBA.
+fn status_icon() -> Option<Icon> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(crate::platform::APP_ICON_HEADER));
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    buf.truncate(info.buffer_size());
+    Icon::from_rgba(buf, info.width, info.height).ok()
+}
+
+// --- process-level helpers ---------------------------------------------------
+
+/// Modal alert through `osascript` (no AppKit dependency in this layer), plus
+/// stderr so a headless launch still leaves a trace.
+pub fn alert(message: &str) {
+    eprintln!("[ms-audio-dock-remapper] {message}");
+    let script = format!(
+        "display alert \"MS Audio Dock Remapper\" message \"{}\" as warning",
+        message.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    let _ = Command::new("osascript").args(["-e", &script]).status();
+}
+
+/// Stops the read loop and removes the status item (main thread only for the
+/// latter; from another thread the thread-local slot is simply empty).
+pub fn request_quit() {
+    QUIT.store(true, Ordering::SeqCst);
+    STATUS_ITEM.with(|slot| {
+        slot.borrow_mut().take();
+    });
+}
+
+/// No-op: AppKit windows are DPI-aware by construction.
+pub fn set_dpi_aware() {}
+
+/// Takes an exclusive `flock` on a file in the user's cache directory. The lock
+/// dies with the process, so a crash never leaves a stale "already running".
+pub fn ensure_single_instance() -> bool {
+    let dir = dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("ms-audio-dock-remapper");
+    let _ = fs::create_dir_all(&dir);
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("instance.lock"))
+    else {
+        // Cannot lock: better to run than to refuse over a filesystem problem.
+        return true;
+    };
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if locked {
+        *INSTANCE_LOCK.lock().unwrap() = Some(file);
+    }
+    locked
+}
+
+pub fn release_single_instance() {
+    INSTANCE_LOCK.lock().unwrap().take();
+}
+
+// --- login autostart (LaunchAgent) -------------------------------------------
+
+fn launch_agent_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| {
+        home.join("Library")
+            .join("LaunchAgents")
+            .join(format!("{LAUNCH_AGENT_LABEL}.plist"))
+    })
+}
+
+pub fn autostart_enabled() -> bool {
+    launch_agent_path().is_some_and(|p| p.is_file())
+}
+
+/// Writes (or removes) a per-user LaunchAgent that runs this executable at
+/// login. The agent is deliberately not bootstrapped/booted-out live: with
+/// `RunAtLoad` that would start a second instance now, and `bootout` would
+/// kill this very process when it was itself started by launchd.
+pub fn set_autostart(enable: bool, start_minimized: bool) {
+    let Some(path) = launch_agent_path() else {
+        return;
+    };
+    if !enable {
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut args = vec![exe.to_string_lossy().into_owned()];
+    if start_minimized {
+        args.push(MINIMIZED_FLAG.to_string());
+    }
+    let program_args: String = args
+        .iter()
+        .map(|a| format!("\t\t<string>{}</string>\n", xml_escape(a)))
+        .collect();
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>{LAUNCH_AGENT_LABEL}</string>
+	<key>ProgramArguments</key>
+	<array>
+{program_args}	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+</dict>
+</plist>
+"#
+    );
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Err(e) = fs::write(&path, plist) {
+        eprintln!("[ms-audio-dock-remapper] failed to write LaunchAgent: {e}");
+    }
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{match_teams, status_icon};
+
+    #[test]
+    fn embedded_header_png_decodes_into_a_status_icon() {
+        assert!(status_icon().is_some(), "public/app-icon-header.png must stay 8-bit RGBA");
+    }
+
+    #[test]
+    fn recognizes_the_dock_teams_report() {
+        assert_eq!(match_teams(&[0x9B, 0x01]), Some(false));
+        assert_eq!(match_teams(&[0x9B, 0x00]), Some(true));
+    }
+
+    #[test]
+    fn ignores_other_collections_on_the_shared_interface() {
+        assert_eq!(match_teams(&[0x01, 0x01]), None); // volume up
+        assert_eq!(match_teams(&[0x04, 0x08]), None); // play/pause
+        assert_eq!(match_teams(&[0x08, 0x01]), None); // telephony mute
+        assert_eq!(match_teams(&[0x9B]), None);
+    }
+}

@@ -1069,6 +1069,11 @@ const FONT_CANDIDATES: &[(&str, &str)] = &[
 /// tofu. Used as the per-`Text` `font-family` binding (a belt-and-suspenders
 /// measure alongside the global `SLINT_DEFAULT_FONT` set in `set_default_cjk_font`).
 fn default_ui_font() -> String {
+    // macOS: the system font stack (San Francisco + PingFang fallback) already
+    // renders CJK, so leave the family at Slint's default.
+    if cfg!(target_os = "macos") {
+        return String::new();
+    }
     for (file, family) in FONT_CANDIDATES {
         if std::path::Path::new(file).exists() {
             return family.to_string();
@@ -1093,6 +1098,9 @@ fn default_ui_font_path() -> Option<String> {
 /// `CheckBox`/`ComboBox` widget labels and dropdown items — renders Chinese
 /// instead of tofu. Must run before the first Slint window is created.
 fn set_default_cjk_font() {
+    if cfg!(target_os = "macos") {
+        return;
+    }
     if let Some(path) = default_ui_font_path() {
         std::env::set_var("SLINT_DEFAULT_FONT", path);
     }
@@ -1156,6 +1164,10 @@ fn apply_event(ui: &AppWindow, config: &Arc<Mutex<Config>>, ev: MonitorEvent) {
         }
         MonitorEvent::TrayShow => {
             let _ = ui.show();
+        }
+        MonitorEvent::Quit => {
+            platform::request_quit();
+            let _ = slint::quit_event_loop();
         }
     }
 }

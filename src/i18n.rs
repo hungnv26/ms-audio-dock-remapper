@@ -5,6 +5,7 @@
 //! is empty/"auto") and can be overridden by the user via the in-UI language
 //! switcher. The chosen value is persisted in `Config.language`.
 
+#[cfg(windows)]
 use windows_sys::Win32::Globalization::GetUserDefaultUILanguage;
 
 /// Supported UI languages.
@@ -52,7 +53,27 @@ impl Lang {
                 return Lang::Zh;
             }
         }
-        // On non-Windows or unknown system language, fall back to English.
+        #[cfg(target_os = "macos")]
+        {
+            // `AppleLanguages` lists the user's preferred languages in order,
+            // e.g. `("zh-Hans-CN", "en-US")`. GUI processes launched from
+            // Finder/launchd carry no LANG, so the defaults database is the
+            // reliable source.
+            if let Ok(out) = std::process::Command::new("defaults")
+                .args(["read", "-g", "AppleLanguages"])
+                .output()
+            {
+                let text = String::from_utf8_lossy(&out.stdout);
+                let first = text
+                    .lines()
+                    .map(|l| l.trim().trim_matches(|c| c == '"' || c == ','))
+                    .find(|l| !l.is_empty() && *l != "(" && *l != ")");
+                if first.is_some_and(|l| l.to_ascii_lowercase().starts_with("zh")) {
+                    return Lang::Zh;
+                }
+            }
+        }
+        // On other platforms or an unknown system language, fall back to English.
         Lang::En
     }
 
@@ -97,6 +118,7 @@ pub fn t(lang: Lang, key: &str) -> &str {
         ("lang_label", "界面语言："),
         ("lang_button", "语言"),
         ("menu_exit", "退出"),
+        ("tray_open", "打开设置…"),
         ("saved", "已保存配置"),
         ("test_ok", "测试动作已执行"),
         ("single_instance", "MsAudioDock Remapper 已在运行。"),
@@ -154,6 +176,7 @@ pub fn t(lang: Lang, key: &str) -> &str {
         ("lang_label", "Language:"),
         ("lang_button", "Language"),
         ("menu_exit", "Exit"),
+        ("tray_open", "Open Settings…"),
         ("saved", "Settings saved"),
         ("test_ok", "Test action executed"),
         (
@@ -183,6 +206,49 @@ pub fn t(lang: Lang, key: &str) -> &str {
         ("preset_beep", "Play a sound (Demo)"),
         ("preset_custom", "Custom program…"),
     ];
+
+    // macOS wording: no registry, no shell:AppsFolder, no tray — a menu bar
+    // item, LaunchAgents and the Applications folders instead. Anything not
+    // listed here falls through to the shared table.
+    #[cfg(target_os = "macos")]
+    {
+        const ZH_MAC: &[(&str, &str)] = &[
+            ("opt_autostart", "登录 macOS 时自动启动"),
+            ("opt_minimize", "启动时仅显示菜单栏图标"),
+            ("hint_tray", "关闭窗口只是隐藏；通过菜单栏图标重新打开。"),
+            ("apps_folder_count", "已找到的应用程序："),
+            ("app_list_fail", "扫描应用程序文件夹失败："),
+            ("search_apps", "搜索应用程序…"),
+            ("no_registered_apps", "未找到应用程序"),
+            ("no_app_selected", "请先选择一个应用程序。"),
+            ("app_no_longer_registered", "已不存在"),
+            ("init_fail", "无法初始化 HID 监听："),
+        ];
+        const EN_MAC: &[(&str, &str)] = &[
+            ("opt_autostart", "Launch at login"),
+            ("opt_minimize", "Start hidden (menu bar icon only)"),
+            (
+                "hint_tray",
+                "Closing the window hides it; use the menu bar icon to reopen.",
+            ),
+            ("apps_folder_count", "Applications found: "),
+            ("app_list_fail", "Failed to scan the Applications folders: "),
+            ("search_apps", "Search applications…"),
+            ("no_registered_apps", "No applications found"),
+            ("no_app_selected", "Select an application first."),
+            ("app_no_longer_registered", "no longer installed"),
+            ("init_fail", "Failed to initialize HID monitoring: "),
+        ];
+        let overrides = match lang {
+            Lang::Zh => ZH_MAC,
+            Lang::En => EN_MAC,
+        };
+        for (k, v) in overrides {
+            if *k == key {
+                return v;
+            }
+        }
+    }
 
     let table = match lang {
         Lang::Zh => ZH,

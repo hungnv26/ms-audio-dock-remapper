@@ -42,9 +42,16 @@ Windows Shell, using the same registered application catalog exposed by
 programs and packaged Microsoft Store applications while keeping the device
 listener responsive.
 
+On macOS the same read-only monitoring runs through IOKit (via `hidapi`, in
+shared mode so macOS keeps handling the Dock's own volume and media keys), the
+app lives in the menu bar instead of the tray, and the picker lists the `.app`
+bundles from the Applications folders. The Dock sends the identical Teams
+report on both systems.
+
 ## Requirements
 
-- Windows 10 or Windows 11, x64
+- Windows 10 or Windows 11, x64, **or** macOS 11 or later (Apple silicon and
+  Intel; build from source, see below)
 - Microsoft Audio Dock
 
 The built-in device profile targets the standard Microsoft Audio Dock HID
@@ -120,6 +127,24 @@ Audio Dock firmware or driver.
 The interface follows the Windows UI language on first launch. English and
 Chinese can also be selected directly from the application menu, and the
 selection is remembered.
+
+## macOS
+
+There is no prebuilt macOS download yet. Build the app bundle from source:
+
+```bash
+brew install rustup && rustup default stable   # once
+./build-macos.sh
+```
+
+This produces `target/release/MS Audio Dock Remapper.app`, signed ad hoc;
+pass a Developer ID identity as the first argument to sign for distribution.
+Copy the bundle to `/Applications` and open it. The app shows a menu bar icon
+(no Dock icon); use its menu to open the settings window or quit. "Launch at
+login" writes a per-user LaunchAgent under `~/Library/LaunchAgents/`.
+
+No Input Monitoring or Accessibility permission is required: the Dock's Teams
+key lives in a vendor HID collection that macOS leaves open to applications.
 
 ## Development
 

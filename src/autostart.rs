@@ -1,6 +1,6 @@
 //! Login autostart. Windows writes the HKCU Run registry value (no admin
-//! needed). Other platforms write the OS-appropriate launcher file; for now
-//! they are stubbed with a clear TODO so the architecture is in place.
+//! needed); macOS writes a per-user LaunchAgent. Both live behind the
+//! `platform` backend so this module stays OS-agnostic.
 
 /// Switch appended to the autostart command line when "start minimized to the
 /// tray" is on. It deliberately duplicates `Settings::minimize_to_tray`: the
@@ -9,29 +9,13 @@
 pub const MINIMIZED_FLAG: &str = "--minimized";
 
 pub fn is_enabled() -> bool {
-    #[cfg(windows)]
-    {
-        crate::platform::windows::autostart_enabled()
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    crate::platform::autostart_enabled()
 }
 
 /// Registers/unregisters the login entry. `start_minimized` decides whether the
 /// registered command line carries [`MINIMIZED_FLAG`].
 pub fn set_enabled(enable: bool, start_minimized: bool) {
-    #[cfg(windows)]
-    {
-        crate::platform::windows::set_autostart(enable, start_minimized);
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (enable, start_minimized);
-        // TODO(linux): write ~/.config/autostart/ms-audio-dock-remapper.desktop
-        // TODO(macos): write ~/Library/LaunchAgents/...plist
-    }
+    crate::platform::set_autostart(enable, start_minimized);
 }
 
 /// True when this process was launched with the tray-only switch. Leading `-`

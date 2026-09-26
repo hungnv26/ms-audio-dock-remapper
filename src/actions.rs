@@ -2,8 +2,8 @@ use crate::config::Config;
 use crate::installed_apps;
 use crate::presets;
 
-/// Plays the Windows default notification sound. On non-Windows platforms this
-/// is currently a no-op (best-effort; extend with afplay/paplay).
+/// Plays the platform's default notification sound (Windows `MessageBeep`, a
+/// system sound through `afplay` on macOS). Elsewhere this is a no-op.
 pub fn beep() {
     #[cfg(windows)]
     {
@@ -13,9 +13,21 @@ pub fn beep() {
             let _ = MessageBeep(MB_OK);
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
-        // Best-effort: hook up platform sound later (afplay / paplay).
+        // Reap the player on a helper thread so it never lingers as a zombie.
+        if let Ok(mut child) = std::process::Command::new("afplay")
+            .arg("/System/Library/Sounds/Tink.aiff")
+            .spawn()
+        {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        // Best-effort: hook up platform sound later (paplay).
     }
 }
 
