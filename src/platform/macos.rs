@@ -65,10 +65,7 @@ fn lang_of(config: &Arc<Mutex<Config>>) -> Lang {
 /// worker and the HID read loop. Called from `ui::run` on the main thread
 /// before the Slint event loop starts; NSApplication's run loop, driven by
 /// Slint's winit backend, then dispatches the status item's menu actions.
-pub fn start_monitor(
-    on_event: impl Fn(MonitorEvent) + Send + 'static,
-    config: Arc<Mutex<Config>>,
-) {
+pub fn start_monitor(on_event: impl Fn(MonitorEvent) + Send + 'static, config: Arc<Mutex<Config>>) {
     QUIT.store(false, Ordering::SeqCst);
     let on_event: SharedOnEvent = Arc::new(Mutex::new(Box::new(on_event)));
 
@@ -379,7 +376,9 @@ pub fn set_autostart(enable: bool, start_minimized: bool) {
 }
 
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[cfg(test)]
@@ -388,7 +387,10 @@ mod tests {
 
     #[test]
     fn embedded_header_png_decodes_into_a_status_icon() {
-        assert!(status_icon().is_some(), "public/app-icon-header.png must stay 8-bit RGBA");
+        assert!(
+            status_icon().is_some(),
+            "public/app-icon-header.png must stay 8-bit RGBA"
+        );
     }
 
     #[test]

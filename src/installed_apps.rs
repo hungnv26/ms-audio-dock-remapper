@@ -529,7 +529,12 @@ mod tests {
             .iter()
             .filter(|app| {
                 app.icon_rgba.len() == 32 * 32 * 4
-                    && app.icon_rgba.chunks_exact(4).any(|pixel| pixel[3] != 0)
+                    && app
+                        .icon_rgba
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .any(|pixel| pixel[3] != 0)
             })
             .count();
         assert!(

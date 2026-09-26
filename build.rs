@@ -31,6 +31,7 @@ fn main() {
 /// Find `rc.exe` inside the Windows SDK and add its directory to `PATH` so the
 /// resource compiler invoked by `winres` can be located. Searches the common
 /// SDK install locations and accepts the first match.
+#[cfg(windows)]
 fn ensure_rc_on_path() {
     let candidates = [
         r"C:\Program Files (x86)\Windows Kits\10\bin",

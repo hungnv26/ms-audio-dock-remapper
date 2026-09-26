@@ -57,19 +57,19 @@ pub fn tray_icon_path() -> Option<PathBuf> {
 
 // One backend per OS, all exposing the same function surface; the wrappers
 // below are the only thing `main` / `ui` / `autostart` talk to.
-#[cfg(windows)]
-pub mod windows;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(not(any(windows, target_os = "macos")))]
 pub mod stub;
-
 #[cfg(windows)]
-use self::windows as backend;
+pub mod windows;
+
 #[cfg(target_os = "macos")]
 use self::macos as backend;
 #[cfg(not(any(windows, target_os = "macos")))]
 use self::stub as backend;
+#[cfg(windows)]
+use self::windows as backend;
 
 /// Events delivered from the OS-specific resident monitor thread to the UI
 /// thread. Keeping this enum platform-agnostic lets `main`/`ui` stay identical

@@ -1,0 +1,72 @@
+name: macOS CI
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Check, test and bundle
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Rust build files
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        # The installed-apps test scans the runner's Applications folders,
+        # which exist on every GitHub macOS image.
+        run: cargo test --locked
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Build app bundle
+        run: ./build-macos.sh
+
+      - name: Smoke-test the bundle
+        run: |
+          APP="target/release/MS Audio Dock Remapper.app"
+          codesign --verify --verbose=2 "$APP"
+          plutil -lint "$APP/Contents/Info.plist"
+          # No Dock on the runner: the app must still start, report the
+          # missing device, and keep running until it is told to quit.
+          "$APP/Contents/MacOS/ms-audio-dock-remapper" --minimized &
+          PID=$!
+          sleep 5
+          kill -0 "$PID"
+          kill "$PID"
+
+      - name: Package bundle
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent "target/release/MS Audio Dock Remapper.app" \
+            "dist/MS-Audio-Dock-Remapper-macos-${{ github.sha }}.zip"
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MS-Audio-Dock-Remapper-macos
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
