@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use crate::config::Config;
+use crate::config::{Button, Config};
 use crate::platform::MonitorEvent;
 
 /// Placeholder backend for platforms without an input implementation yet. The
@@ -30,6 +30,10 @@ pub fn ensure_single_instance() -> bool {
 }
 
 pub fn set_dpi_aware() {}
+
+pub fn supported_buttons() -> &'static [Button] {
+    &Button::ALL
+}
 
 pub fn autostart_enabled() -> bool {
     false

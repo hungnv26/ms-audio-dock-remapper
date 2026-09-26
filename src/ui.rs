@@ -1,561 +1,552 @@
-use std::cell::Cell;
+//! Settings window, laid out like macOS System Settings: a sidebar with
+//! sections on the left, grouped rows on the right. Widgets come from Slint's
+//! platform style (cupertino on macOS, fluent on Windows; chosen in build.rs).
+//!
+//! Every change applies and saves immediately; there is no Save button.
+
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use slint::{
-    invoke_from_event_loop, CloseRequestResponse, Rgba8Pixel, SharedPixelBuffer, Timer, TimerMode,
-    VecModel, Weak,
+    invoke_from_event_loop, CloseRequestResponse, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer,
+    Timer, TimerMode, VecModel, Weak,
 };
 
 use crate::actions;
 use crate::autostart;
-use crate::config::Config;
-use crate::i18n::{self, Lang};
+use crate::config::{ActionKind, Button as DockButton, Config};
+use crate::i18n::t;
+use crate::installed_apps::InstalledApp;
 use crate::platform::{self, MonitorEvent};
 
 slint::slint! {
-    #[style = "fluent"]
-    import { CheckBox, LineEdit, ScrollView }
+    import { Button, ComboBox, LineEdit, ListView, ScrollView, Switch, Palette }
         from "std-widgets.slint";
 
-    export struct AppChoice {
+    export struct ButtonEntry {
+        name: string,
+        summary: string,
+        icon: image,
+        tint: color,
+    }
+
+    export struct AppEntry {
         name: string,
         icon: image,
-        visible: bool,
     }
 
-    // Single source of truth for the visual language: colors, radii, motion.
-    // Every component below reads from here so retheming stays in one place.
+    // System Settings look: light/dark pairs picked to match macOS. The
+    // widget chrome itself (switches, popups, fields) comes from the style.
     global Theme {
-        in-out property <color> bg: #f4f6f9;
-        in-out property <color> surface: #ffffff;
-        in-out property <color> border: #e7e9ee;
-        in-out property <color> divider: #eef0f4;
-        in-out property <color> text: #0f172a;
-        in-out property <color> text2: #64748b;
-        in-out property <color> text3: #9aa3b2;
-        in-out property <color> accent: #3b66f5;
-        in-out property <color> accent-press: #2f54d6;
-        in-out property <color> accent-soft: #eaf0ff;
-        in-out property <color> ok: #0f9d6b;
-        in-out property <length> radius: 14px;
+        out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+        out property <color> window: dark ? #1f1f1f : #f5f5f7;
+        out property <color> sidebar: dark ? #2a2a2a : #ebebed;
+        out property <color> sidebar-selected: dark ? #ffffff24 : #00000016;
+        out property <color> sidebar-hover: dark ? #ffffff10 : #0000000a;
+        out property <color> card: dark ? #2b2b2b : #ffffff;
+        out property <color> card-border: dark ? #ffffff16 : #00000012;
+        out property <color> divider: dark ? #ffffff14 : #0000000f;
+        out property <color> row-hover: dark ? #ffffff0c : #0000000a;
+        out property <color> row-selected: dark ? #ffffff16 : #00000012;
+        out property <color> text: dark ? #f2f2f2 : #1d1d1f;
+        out property <color> text2: dark ? #9d9da1 : #6e6e73;
+        out property <color> accent: dark ? #0a84ff : #007aff;
+        out property <color> green: #34c759;
+        out property <color> gray: #8e8e93;
     }
 
-    // A rounded card surface used to group related controls.
-    component Card inherits Rectangle {
-        property <length> pad: 16px;
-        background: Theme.surface;
-        border-radius: Theme.radius;
-        border-width: 1px;
-        border-color: Theme.border;
-        VerticalLayout {
-            padding: root.pad;
-            spacing: 8px;
-            @children
-        }
-    }
-
-    // Filled, primary action button (accent).
-    component PrimaryButton inherits Rectangle {
-        in-out property <string> text: "";
-        in-out property <bool> enabled: true;
-        in-out property <string> font: "Microsoft YaHei";
-        callback clicked;
-        height: 42px;
-        border-radius: 11px;
-        background: root.enabled
-            ? (touch-area.has-hover ? Theme.accent-press : Theme.accent)
-            : #c7d0e6;
-        touch-area := TouchArea {
-            enabled: root.enabled;
-            width: 100%;
-            height: 100%;
-            clicked => { if root.enabled { root.clicked(); } }
-        }
-        Text {
-            text: root.text;
-            color: #ffffff;
-            font-size: 14px;
-            font-weight: 600;
-            font-family: root.font;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-        }
-    }
-
-    // Outlined, secondary action button.
-    component SecondaryButton inherits Rectangle {
-        in-out property <string> text: "";
-        in-out property <bool> enabled: true;
-        in-out property <string> font: "Microsoft YaHei";
-        callback clicked;
-        height: 42px;
-        border-radius: 11px;
-        background: touch-area.has-hover ? #eef1f6 : Theme.surface;
-        border-width: 1px;
-        border-color: Theme.border;
-        touch-area := TouchArea {
-            enabled: root.enabled;
-            width: 100%;
-            height: 100%;
-            clicked => { if root.enabled { root.clicked(); } }
-        }
-        Text {
-            text: root.text;
-            color: Theme.text;
-            font-size: 14px;
-            font-weight: 600;
-            font-family: root.font;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-        }
-    }
-
-    // Flat WinForms/MenuStrip-like command: transparent until hover/press.
-    component MenuItem inherits Rectangle {
-        in-out property <string> text: "";
-        in-out property <string> font: "Microsoft YaHei";
+    component IconBadge inherits Rectangle {
         in property <image> icon;
-        in property <bool> show-icon: false;
-        callback clicked;
-        height: 28px;
-        border-radius: 2px;
-        background: touch-area.pressed ? #dcdfe4
-                    : touch-area.has-hover ? #e8eaed : #00000000;
-        accessible-role: button;
-        accessible-label: root.text;
-        accessible-action-default => { root.clicked(); }
+        in property <color> tint;
+        in property <length> size: 22px;
+        width: root.size;
+        height: root.size;
+        border-radius: root.size * 0.24;
+        background: root.tint;
+        Image {
+            source: root.icon;
+            colorize: white;
+            width: root.size * 0.66;
+            height: root.size * 0.66;
+            x: (root.size - self.width) / 2;
+            y: (root.size - self.height) / 2;
+        }
+    }
 
+    component SidebarItem inherits Rectangle {
+        in property <string> label;
+        in property <image> icon;
+        in property <color> tint;
+        in property <bool> selected;
+        callback clicked;
+        height: 30px;
+        border-radius: 6px;
+        background: root.selected ? Theme.sidebar-selected
+            : (ta.has-hover ? Theme.sidebar-hover : transparent);
+        ta := TouchArea {
+            clicked => { root.clicked(); }
+        }
         HorizontalLayout {
             padding-left: 8px;
             padding-right: 8px;
-            spacing: 5px;
-            alignment: center;
-            if root.show-icon : Image {
-                y: (parent.height - self.height) / 2;
-                source: root.icon;
-                width: 16px;
-                height: 16px;
-                image-fit: contain;
-                colorize: Theme.text2;
+            spacing: 9px;
+            alignment: start;
+            VerticalLayout {
+                alignment: center;
+                IconBadge { icon: root.icon; tint: root.tint; size: 20px; }
             }
             Text {
-                text: root.text;
-                color: Theme.text;
+                text: root.label;
                 font-size: 13px;
-                font-family: root.font;
+                color: Theme.text;
                 vertical-alignment: center;
             }
         }
-        touch-area := TouchArea {
-            width: 100%;
-            height: 100%;
-            clicked => { root.clicked(); }
+    }
+
+    // A rounded, bordered card holding rows; optional bold title above.
+    component Group inherits VerticalLayout {
+        in property <string> title;
+        spacing: 7px;
+        if root.title != "": Text {
+            text: root.title;
+            font-size: 13px;
+            font-weight: 600;
+            color: Theme.text;
+        }
+        Rectangle {
+            background: Theme.card;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.card-border;
+            clip: true;
+            VerticalLayout {
+                @children
+            }
         }
     }
 
-    // Icon-aware application picker. The standard ComboBox only accepts
-    // strings, so AppsFolder icons require a small custom popup list.
-    component AppSelector inherits Rectangle {
-        in property <[AppChoice]> model;
-        in-out property <int> current-index: 0;
-        in-out property <string> search-text: "";
-        in property <string> search-placeholder: "";
-        in property <int> visible-count: 1;
-        in property <string> font: "Microsoft YaHei";
-        callback filter-changed(string);
-
-        height: 42px;
-        border-radius: 8px;
-        border-width: 1px;
-        border-color: #b8bec8;
-        background: selector-touch.has-hover ? #f8faff : Theme.surface;
-        clip: true;
-        accessible-role: combobox;
-        accessible-label: root.current-index >= 0 && root.current-index < root.model.length
-            ? root.model[root.current-index].name : "";
-
-        if root.current-index >= 0 && root.current-index < root.model.length : Image {
-            x: 10px;
-            y: (root.height - self.height) / 2;
-            source: root.model[root.current-index].icon;
-            width: 24px;
-            height: 24px;
-            image-fit: contain;
+    // Label (+ optional detail line) on the left, controls on the right.
+    component Row inherits Rectangle {
+        in property <string> label;
+        in property <string> detail;
+        in property <bool> divider: true;
+        in property <bool> selectable: false;
+        in property <bool> selected: false;
+        in property <image> icon;
+        in property <color> tint: Theme.gray;
+        in property <bool> show-icon: false;
+        callback clicked;
+        background: root.selected ? Theme.row-selected
+            : (root.selectable && ta.has-hover ? Theme.row-hover : transparent);
+        ta := TouchArea {
+            enabled: root.selectable;
+            clicked => { root.clicked(); }
         }
-        Text {
-            x: 43px;
-            y: 0px;
-            width: root.width - 78px;
-            height: root.height;
-            text: root.current-index >= 0 && root.current-index < root.model.length
-                ? root.model[root.current-index].name : "";
-            color: Theme.text;
-            font-size: 13px;
-            font-family: root.font;
-            horizontal-alignment: left;
-            vertical-alignment: center;
-            overflow: elide;
-        }
-        // Draw the chevron as a path instead of a font glyph. Some selected UI
-        // fonts rendered the old glyph as a tofu square.
-        Path {
-            x: root.width - 25px;
-            y: (root.height - self.height) / 2;
-            width: 12px;
-            height: 7px;
-            commands: "M 1 1 L 6 6 L 11 1";
-            fill: #00000000;
-            stroke: Theme.text2;
-            stroke-width: 1.5px;
-        }
-        selector-touch := TouchArea {
-            width: 100%;
-            height: 100%;
-            clicked => { app-popup.show(); }
-        }
-
-        app-popup := PopupWindow {
-            x: 0px;
-            y: root.height + 4px;
-            width: root.width;
-            height: min(400px, root.visible-count * 40px + 56px);
-            close-policy: close-on-click-outside;
-            forward-focus: search-input;
-
-            Rectangle {
-                background: Theme.surface;
-                border-width: 1px;
-                border-color: Theme.border;
-                border-radius: 8px;
-                clip: true;
-                Rectangle {
-                    x: 0px;
-                    y: 0px;
-                    width: parent.width;
-                    height: 52px;
-                    background: Theme.surface;
-                    search-input := LineEdit {
-                        x: 8px;
-                        y: 8px;
-                        width: parent.width - 16px;
-                        height: 36px;
-                        text <=> root.search-text;
-                        placeholder-text: root.search-placeholder;
-                        font-family: root.font;
-                        edited(text) => { root.filter-changed(text); }
+        VerticalLayout {
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 12px;
+                padding-top: 9px;
+                padding-bottom: 9px;
+                spacing: 12px;
+                if root.show-icon: VerticalLayout {
+                    alignment: center;
+                    IconBadge { icon: root.icon; tint: root.tint; size: 26px; }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: root.label;
+                        font-size: 13px;
+                        color: Theme.text;
                     }
-                    Rectangle {
-                        y: parent.height - 1px;
-                        width: parent.width;
-                        height: 1px;
-                        background: Theme.divider;
+                    if root.detail != "": Text {
+                        text: root.detail;
+                        font-size: 11px;
+                        color: Theme.text2;
+                        wrap: word-wrap;
                     }
                 }
-                ScrollView {
-                    x: 0px;
-                    y: 52px;
-                    width: parent.width;
-                    height: parent.height - 52px;
-                    VerticalLayout {
-                        padding-top: 4px;
-                        padding-bottom: 4px;
-                        spacing: 0px;
-                        for choice[index] in root.model : Rectangle {
-                            visible: choice.visible;
-                            height: choice.visible ? 40px : 0px;
-                            background: row-touch.has-hover ? Theme.accent-soft
-                                : index == root.current-index ? #f2f5fb : Theme.surface;
-                            Image {
-                                x: 10px;
-                                y: (parent.height - self.height) / 2;
-                                source: choice.icon;
-                                width: 24px;
-                                height: 24px;
-                                image-fit: contain;
-                            }
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 0;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: end;
+                        @children
+                    }
+                }
+            }
+            if root.divider: Rectangle {
+                height: 1px;
+                background: Theme.divider;
+            }
+        }
+    }
+
+    component PageTitle inherits Text {
+        font-size: 22px;
+        font-weight: 700;
+        color: Theme.text;
+    }
+
+    component Caption inherits Text {
+        font-size: 11px;
+        color: Theme.text2;
+        wrap: word-wrap;
+    }
+
+    export component AppWindow inherits Window {
+        title: "Audio Dock";
+        icon: root.app-icon;
+        background: Theme.window;
+        min-width: 700px;
+        min-height: 600px;
+        preferred-width: 780px;
+        preferred-height: 820px;
+
+        in property <image> app-icon;
+        in-out property <int> page: 0;
+
+        // Sidebar status
+        in property <bool> connected: false;
+        in property <string> status-text: "Not connected";
+        in property <string> collections-text: "0";
+        in property <string> device-text;
+        in property <string> version;
+
+        // Buttons page
+        in property <[ButtonEntry]> buttons;
+        in-out property <int> selected-button: 0;
+        in property <string> detail-title;
+        in property <string> detail-hint;
+        in-out property <int> action-kind: 0;
+        in property <[AppEntry]> apps;
+        in-out property <string> app-filter;
+        in property <int> selected-app: -1;
+        in-out property <string> command;
+        in-out property <string> arguments;
+        in property <string> last-press-text: "No presses yet";
+        in property <string> media-hint;
+
+        // General page
+        in-out property <bool> enabled: true;
+        in-out property <bool> confirm-sound: true;
+        in-out property <bool> launch-at-login: false;
+        in-out property <bool> start-hidden: false;
+        in property <string> start-hidden-hint;
+
+        callback button-selected(int);
+        callback action-kind-changed(int);
+        callback app-filter-changed(string);
+        callback app-selected(int);
+        callback command-changed(string);
+        callback arguments-changed(string);
+        callback test-action();
+        callback setting-changed();
+        callback open-repo();
+        callback quit-app();
+
+        HorizontalLayout {
+            // ---- sidebar -------------------------------------------------
+            Rectangle {
+                width: 200px;
+                background: Theme.sidebar;
+                VerticalLayout {
+                    padding: 12px;
+                    padding-top: 16px;
+                    spacing: 3px;
+                    alignment: start;
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        padding-bottom: 14px;
+                        spacing: 10px;
+                        alignment: start;
+                        VerticalLayout {
+                            alignment: center;
+                            Image { source: root.app-icon; width: 40px; height: 40px; }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 3px;
                             Text {
-                                x: 43px;
-                                y: 0px;
-                                width: parent.width - 53px;
-                                height: parent.height;
-                                text: choice.name;
+                                text: "Audio Dock";
+                                font-size: 15px;
+                                font-weight: 600;
                                 color: Theme.text;
-                                font-size: 13px;
-                                font-family: root.font;
-                                horizontal-alignment: left;
-                                vertical-alignment: center;
-                                overflow: elide;
                             }
-                            row-touch := TouchArea {
-                                width: 100%;
-                                height: 100%;
-                                clicked => {
-                                    root.current-index = index;
-                                    app-popup.close();
+                            HorizontalLayout {
+                                spacing: 5px;
+                                alignment: start;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        width: 8px;
+                                        height: 8px;
+                                        border-radius: 4px;
+                                        background: root.connected ? Theme.green : Theme.gray;
+                                    }
+                                }
+                                Text {
+                                    text: root.status-text;
+                                    font-size: 11px;
+                                    color: Theme.text2;
+                                    vertical-alignment: center;
                                 }
                             }
                         }
                     }
+                    SidebarItem {
+                        label: "Buttons";
+                        icon: @image-url("../public/icons/buttons.svg");
+                        tint: #5e5ce6;
+                        selected: root.page == 0;
+                        clicked => { root.page = 0; }
+                    }
+                    SidebarItem {
+                        label: "General";
+                        icon: @image-url("../public/icons/general.svg");
+                        tint: #8e8e93;
+                        selected: root.page == 1;
+                        clicked => { root.page = 1; }
+                    }
+                    SidebarItem {
+                        label: "About";
+                        icon: @image-url("../public/icons/about.svg");
+                        tint: #0a84ff;
+                        selected: root.page == 2;
+                        clicked => { root.page = 2; }
+                    }
                 }
             }
-        }
-    }
+            Rectangle { width: 1px; background: Theme.card-border; }
 
-    export component AppWindow inherits Window {
-        title: root.window-title;
-        width: 460px;
-        height: 660px;
-        background: Theme.bg;
-        // Brand the title bar / taskbar with the same icon shown in the header.
-        icon: root.header-icon;
-
-        in-out property <string> ui-font: "Microsoft YaHei";
-        in-out property <string> window-title: "";
-        in-out property <string> subtitle-text: "";
-        in-out property <string> status-text: "—";
-        in-out property <string> collections-text: "—";
-        in-out property <string> presses-text: "0";
-        in-out property <string> last-text: "—";
-        // Raw running counters, kept on the component so event handling stays
-        // event-driven (no Rust-side shared state captured into a `Send`
-        // closure). `presses-text`/`status-text`/etc. stay the display strings.
-        in-out property <int> presses-count: 0;
-        in-out property <int> status-count: 0;
-        in-out property <int> action-index: 0;
-        in-out property <[AppChoice]> action-model;
-        in-out property <string> action-filter: "";
-        in-out property <int> action-visible-count: 1;
-        in-out property <string> custom-command: "";
-        in-out property <string> custom-args: "";
-        in-out property <bool> enabled: true;
-        in-out property <bool> confirm-beep: true;
-        in-out property <bool> start-windows: false;
-        in-out property <bool> minimize: false;
-        in-out property <int> lang-index: 0;
-        in-out property <[string]> lang-model;
-        in-out property <string> lang-button-label: "";
-        in-out property <string> exit-button-label: "";
-        in-out property <bool> feedback-visible: false;
-        in-out property <string> feedback-text: "";
-        in-out property <string> hint-text: "";
-        in-out property <image> header-icon;
-
-        in-out property <string> action-label: "";
-        in-out property <string> app-list-hint: "";
-        in-out property <string> search-placeholder: "";
-        in-out property <string> custom-command-label: "";
-        in-out property <string> custom-args-label: "";
-        in-out property <string> opt-enabled: "";
-        in-out property <string> opt-beep: "";
-        in-out property <string> opt-autostart: "";
-        in-out property <string> opt-minimize: "";
-        in-out property <string> btn-save: "";
-        in-out property <string> btn-test: "";
-
-        callback save();
-        callback test();
-        callback filter-changed(string);
-        callback lang-chosen(int);
-        callback quit-app();
-
-        VerticalLayout {
-            spacing: 0px;
-
-            // --- native-style menu strip directly below the title bar ---
-            Rectangle {
-                height: 31px;
-                background: #f8f8f8;
-                HorizontalLayout {
-                    padding-left: 4px;
-                    padding-right: 4px;
-                    padding-top: 1px;
-                    padding-bottom: 2px;
-                    spacing: 2px;
-                    MenuItem {
-                        text: root.exit-button-label;
-                        font: root.ui-font;
-                        width: 62px;
-                        horizontal-stretch: 0;
-                        clicked => { root.quit-app(); }
-                    }
-                    MenuItem {
-                        text: root.lang-button-label;
-                        font: root.ui-font;
-                        icon: @image-url("../public/language-icon.svg");
-                        show-icon: true;
-                        width: 88px;
-                        horizontal-stretch: 0;
-                        clicked => { lang_popup.show(); }
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                }
-                Rectangle {
-                    y: parent.height - 1px;
-                    height: 1px;
-                    width: parent.width;
-                    background: #d9dce1;
-                }
-            }
-
-            VerticalLayout {
-                padding: 18px;
-                spacing: 14px;
-
-                // --- header: brand icon + title ---
-                HorizontalLayout {
-                spacing: 12px;
-                Image {
-                    source: root.header-icon;
-                    width: 38px;
-                    height: 38px;
-                    image-fit: contain;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
+            // ---- content -------------------------------------------------
+            ScrollView {
+                viewport-width: self.visible-width;
                 VerticalLayout {
-                    spacing: 2px;
-                    horizontal-stretch: 1;
-                    Text {
-                        text: "Microsoft Audio Dock";
-                        font-size: 18px;
-                        font-weight: 700;
-                        color: Theme.text;
-                        font-family: root.ui-font;
-                        overflow: elide;
-                    }
-                    Text {
-                        text: root.subtitle-text;
-                        font-size: 12px;
-                        color: Theme.text2;
-                        font-family: root.ui-font;
-                        overflow: elide;
-                    }
-                }
-                }
+                    padding: 26px;
+                    padding-top: 22px;
+                    spacing: 22px;
+                    alignment: start;
 
-                // --- live status ---
-                Card {
-                VerticalLayout {
-                    spacing: 6px;
-                    Text { text: root.status-text; color: Theme.text; font-weight: 600; font-family: root.ui-font; }
-                    Text { text: root.collections-text; color: Theme.text2; font-size: 12px; font-family: root.ui-font; }
-                    Text { text: root.presses-text; color: Theme.text; font-size: 12px; font-family: root.ui-font; }
-                    Text { text: root.last-text; color: Theme.text2; font-size: 12px; font-family: root.ui-font; }
-                }
-                }
-
-                // --- action ---
-                Card {
-                VerticalLayout {
-                    spacing: 8px;
-                    Text { text: root.action-label; font-weight: 700; color: Theme.text; font-family: root.ui-font; }
-                    AppSelector {
-                        model: root.action-model;
-                        current-index <=> root.action-index;
-                        search-text <=> root.action-filter;
-                        search-placeholder: root.search-placeholder;
-                        visible-count: root.action-visible-count;
-                        font: root.ui-font;
-                        filter-changed(text) => { root.filter-changed(text); }
-                    }
-                    if root.action-index == 0 : VerticalLayout {
-                        spacing: 6px;
-                        Text { text: root.custom-command-label; color: Theme.text2; font-size: 12px; font-family: root.ui-font; }
-                        LineEdit { text <=> root.custom-command; }
-                        Text { text: root.custom-args-label; color: Theme.text2; font-size: 12px; font-family: root.ui-font; }
-                        LineEdit { text <=> root.custom-args; }
-                    }
-                    Text { text: root.app-list-hint; color: Theme.text2; font-size: 11px; font-family: root.ui-font; }
-                }
-                }
-
-                // --- options ---
-                Card {
-                VerticalLayout {
-                    spacing: 4px;
-                    CheckBox { text: root.opt-enabled; checked <=> root.enabled; }
-                    CheckBox { text: root.opt-beep; checked <=> root.confirm-beep; }
-                    CheckBox { text: root.opt-autostart; checked <=> root.start-windows; }
-                    CheckBox { text: root.opt-minimize; checked <=> root.minimize; }
-                }
-                }
-
-                // --- actions ---
-                HorizontalLayout {
-                spacing: 10px;
-                PrimaryButton {
-                    text: root.btn-save;
-                    font: root.ui-font;
-                    horizontal-stretch: 1;
-                    clicked => { root.save(); }
-                }
-                SecondaryButton {
-                    text: root.btn-test;
-                    font: root.ui-font;
-                    horizontal-stretch: 1;
-                    clicked => { root.test(); }
-                }
-                }
-
-                // --- feedback / hint ---
-                Rectangle {
-                height: 44px;
-                border-radius: 10px;
-                background: root.feedback-visible ? Theme.accent-soft : #f1f3f7;
-                Text {
-                    text: root.feedback-visible ? root.feedback-text : root.hint-text;
-                    color: root.feedback-visible ? Theme.accent : Theme.text3;
-                    font-size: 11px;
-                    wrap: word-wrap;
-                    vertical-alignment: center;
-                    x: 12px;
-                    width: parent.width - 24px;
-                    font-family: root.ui-font;
-                }
-                }
-            }
-        }
-
-        // Language dropdown, anchored below the menu-bar language button.
-        lang_popup := PopupWindow {
-            x: 68px;
-            y: 31px;
-            width: 150px;
-            height: 76px;
-            close-policy: close-on-click-outside;
-
-            Rectangle {
-                background: Theme.surface;
-                border-radius: 12px;
-                border-width: 1px;
-                border-color: Theme.border;
-                VerticalLayout {
-                    padding: 6px;
-                    spacing: 4px;
-
-                    for name[index] in root.lang-model : Rectangle {
-                        height: 32px;
-                        border-radius: 8px;
-                        background: index == root.lang-index ? Theme.accent-soft
-                                    : touch-area.has-hover ? Theme.bg : #00000000;
-                        Text {
-                            text: name;
-                            vertical-alignment: center;
-                            horizontal-alignment: left;
-                            x: 12px;
-                            width: parent.width - 16px;
-                            color: Theme.text;
-                            font-family: root.ui-font;
+                    if root.page == 0: VerticalLayout {
+                        spacing: 22px;
+                        alignment: start;
+                        PageTitle { text: "Buttons"; }
+                        Group {
+                            title: "Dock buttons";
+                            for entry[i] in root.buttons: Row {
+                                label: entry.name;
+                                icon: entry.icon;
+                                tint: entry.tint;
+                                show-icon: true;
+                                selectable: true;
+                                selected: root.selected-button == i;
+                                divider: i < root.buttons.length - 1;
+                                clicked => { root.button-selected(i); }
+                                Text {
+                                    text: entry.summary;
+                                    font-size: 13px;
+                                    color: Theme.text2;
+                                    vertical-alignment: center;
+                                }
+                                Image {
+                                    source: @image-url("../public/icons/chevron.svg");
+                                    colorize: Theme.text2;
+                                    width: 14px;
+                                    height: 14px;
+                                }
+                            }
                         }
-                        touch-area := TouchArea {
-                            width: 100%;
-                            height: 100%;
-                            clicked => {
-                                root.lang-chosen(index);
-                                lang_popup.close();
+                        Group {
+                            title: root.detail-title;
+                            Row {
+                                label: "When pressed";
+                                detail: root.detail-hint;
+                                ComboBox {
+                                    width: 250px;
+                                    model: ["No action", "Open an application", "Open a URL or run a command", "Play a sound"];
+                                    current-index <=> root.action-kind;
+                                    selected => { root.action-kind-changed(self.current-index); }
+                                }
+                            }
+                            if root.action-kind == 1: Row {
+                                label: "Application";
+                                detail: "Pick the app to open or bring to the front";
+                                LineEdit {
+                                    width: 250px;
+                                    placeholder-text: "Search applications";
+                                    text <=> root.app-filter;
+                                    edited => { root.app-filter-changed(self.text); }
+                                }
+                            }
+                            if root.action-kind == 1: Rectangle {
+                                height: 216px;
+                                ListView {
+                                    for app[i] in root.apps: Rectangle {
+                                        height: 30px;
+                                        background: root.selected-app == i ? Theme.accent
+                                            : (item-ta.has-hover ? Theme.row-hover : transparent);
+                                        item-ta := TouchArea {
+                                            clicked => { root.app-selected(i); }
+                                        }
+                                        HorizontalLayout {
+                                            padding-left: 14px;
+                                            padding-right: 14px;
+                                            spacing: 10px;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Image { source: app.icon; width: 20px; height: 20px; }
+                                            }
+                                            Text {
+                                                text: app.name;
+                                                font-size: 13px;
+                                                color: root.selected-app == i ? white : Theme.text;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+                                }
+                                Rectangle { y: parent.height - 1px; height: 1px; background: Theme.divider; }
+                            }
+                            if root.action-kind == 2: Row {
+                                label: "Command or URL";
+                                detail: "A URL, a file, or a program to run";
+                                LineEdit {
+                                    width: 300px;
+                                    placeholder-text: "https://example.com";
+                                    text <=> root.command;
+                                    edited => { root.command-changed(self.text); }
+                                }
+                            }
+                            if root.action-kind == 2: Row {
+                                label: "Arguments";
+                                detail: "Optional, space separated";
+                                LineEdit {
+                                    width: 300px;
+                                    text <=> root.arguments;
+                                    edited => { root.arguments-changed(self.text); }
+                                }
+                            }
+                            Row {
+                                label: "Try the action";
+                                detail: root.last-press-text;
+                                divider: false;
+                                Button {
+                                    text: "Test";
+                                    enabled: root.action-kind != 0;
+                                    clicked => { root.test-action(); }
+                                }
+                            }
+                        }
+                        Caption { text: root.media-hint; }
+                    }
+
+                    if root.page == 1: VerticalLayout {
+                        spacing: 22px;
+                        alignment: start;
+                        PageTitle { text: "General"; }
+                        Group {
+                            title: "Remapping";
+                            Row {
+                                label: "Run button actions";
+                                detail: "Turn off to pause all remapping without quitting";
+                                Switch {
+                                    checked <=> root.enabled;
+                                    toggled => { root.setting-changed(); }
+                                }
+                            }
+                            Row {
+                                label: "Confirmation sound";
+                                detail: "Play a short sound after an action runs";
+                                divider: false;
+                                Switch {
+                                    checked <=> root.confirm-sound;
+                                    toggled => { root.setting-changed(); }
+                                }
+                            }
+                        }
+                        Group {
+                            title: "Startup";
+                            Row {
+                                label: "Launch at login";
+                                Switch {
+                                    checked <=> root.launch-at-login;
+                                    toggled => { root.setting-changed(); }
+                                }
+                            }
+                            Row {
+                                label: "Start hidden";
+                                detail: root.start-hidden-hint;
+                                divider: false;
+                                Switch {
+                                    checked <=> root.start-hidden;
+                                    toggled => { root.setting-changed(); }
+                                }
+                            }
+                        }
+                    }
+
+                    if root.page == 2: VerticalLayout {
+                        spacing: 22px;
+                        alignment: start;
+                        PageTitle { text: "About"; }
+                        HorizontalLayout {
+                            spacing: 16px;
+                            alignment: start;
+                            VerticalLayout {
+                                alignment: center;
+                                Image { source: root.app-icon; width: 64px; height: 64px; }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 3px;
+                                Text {
+                                    text: "Audio Dock Remapper";
+                                    font-size: 17px;
+                                    font-weight: 700;
+                                    color: Theme.text;
+                                }
+                                Caption { text: "Version " + root.version; }
+                                Caption {
+                                    text: "Remaps the buttons of the Microsoft Audio Dock. Monitoring is read-only: nothing is written to the device.";
+                                }
+                            }
+                        }
+                        Group {
+                            title: "Device";
+                            Row {
+                                label: "Status";
+                                Text { text: root.status-text; font-size: 13px; color: Theme.text2; vertical-alignment: center; }
+                            }
+                            Row {
+                                label: "USB identity";
+                                Text { text: root.device-text; font-size: 13px; color: Theme.text2; vertical-alignment: center; }
+                            }
+                            Row {
+                                label: "Matching HID collections";
+                                divider: false;
+                                Text { text: root.collections-text; font-size: 13px; color: Theme.text2; vertical-alignment: center; }
+                            }
+                        }
+                        Group {
+                            Row {
+                                label: "Source code";
+                                detail: "github.com/Masterain98/ms-audio-dock-remapper";
+                                Button { text: "Open"; clicked => { root.open-repo(); } }
+                            }
+                            Row {
+                                label: "Quit Audio Dock Remapper";
+                                detail: "Stops listening to the Dock until the app is opened again";
+                                divider: false;
+                                Button { text: "Quit"; clicked => { root.quit-app(); } }
                             }
                         }
                     }
@@ -563,116 +554,315 @@ slint::slint! {
             }
         }
     }
-
 }
 
-/// Running counters (press count, device status, last trigger time) live in
-/// Slint `int`/`string` properties so the event handler can stay fully
-/// event-driven and avoid capturing any `!Send` Rust state into the `Send`
-/// closure passed to `slint::invoke_from_event_loop`.
-///
-/// `start_minimized` comes from `main` (persisted setting or the `--minimized`
-/// switch on the login entry) and decides whether the settings window is shown
-/// at all; the resident monitor and the tray icon start either way.
-pub fn run(config: Arc<Mutex<Config>>, initial_lang: Lang, start_minimized: bool) {
-    // Fix CJK tofu globally (must happen before the first Slint window, which
-    // is when the font collection is created).
-    set_default_cjk_font();
+const REPO_URL: &str = "https://github.com/Masterain98/ms-audio-dock-remapper";
 
+/// Everything the callbacks need, shared through `Rc`.
+struct State {
+    config: Arc<Mutex<Config>>,
+    apps: Vec<InstalledApp>,
+    /// Indices into `apps` currently shown by the picker (after filtering).
+    filtered: RefCell<Vec<usize>>,
+    buttons: &'static [DockButton],
+    selected: Cell<usize>,
+    button_model: Rc<VecModel<ButtonEntry>>,
+    app_model: Rc<VecModel<AppEntry>>,
+}
+
+impl State {
+    fn current(&self) -> DockButton {
+        self.buttons
+            .get(self.selected.get())
+            .copied()
+            .unwrap_or(DockButton::Teams)
+    }
+
+    fn save(&self) {
+        if let Err(e) = self.config.lock().unwrap().save() {
+            platform::alert(&format!("{} {e}", t("save_fail")));
+        }
+    }
+
+    /// Rewrites the summary column of every button row in place.
+    fn refresh_buttons(&self) {
+        let cfg = self.config.lock().unwrap();
+        for (i, button) in self.buttons.iter().enumerate() {
+            if let Some(mut entry) = self.button_model.row_data(i) {
+                entry.summary = cfg.buttons.get(*button).summary().into();
+                self.button_model.set_row_data(i, entry);
+            }
+        }
+    }
+
+    /// Loads the selected button's action into the detail group.
+    fn refresh_detail(&self, ui: &AppWindow) {
+        let button = self.current();
+        let action = self.config.lock().unwrap().buttons.get(button).clone();
+        ui.set_selected_button(self.selected.get() as i32);
+        ui.set_detail_title(format!("{} button", button.label()).into());
+        ui.set_detail_hint(button.builtin_behavior().into());
+        ui.set_action_kind(action.kind.index() as i32);
+        ui.set_command(action.command.into());
+        ui.set_arguments(action.arguments.into());
+        ui.set_app_filter("".into());
+        self.rebuild_apps(ui, "");
+    }
+
+    /// Filters the picker by `query` and highlights the bound app, if listed.
+    fn rebuild_apps(&self, ui: &AppWindow, query: &str) {
+        let query = query.trim().to_lowercase();
+        let target = self
+            .config
+            .lock()
+            .unwrap()
+            .buttons
+            .get(self.current())
+            .app_target
+            .clone();
+        let mut filtered = Vec::new();
+        let mut entries = Vec::new();
+        let mut selected = -1;
+        for (i, app) in self.apps.iter().enumerate() {
+            if !query.is_empty() && !app.name.to_lowercase().contains(&query) {
+                continue;
+            }
+            if app.target.eq_ignore_ascii_case(&target) {
+                selected = filtered.len() as i32;
+            }
+            filtered.push(i);
+            entries.push(AppEntry {
+                name: app.name.clone().into(),
+                icon: app_icon(app),
+            });
+        }
+        *self.filtered.borrow_mut() = filtered;
+        self.app_model.set_vec(entries);
+        ui.set_selected_app(selected);
+    }
+}
+
+/// Builds the window, wires every control to the config and runs the Slint
+/// event loop until quit. `start_minimized` (persisted setting or the
+/// `--minimized` login switch) keeps the window hidden; the resident monitor
+/// and the tray / menu bar item start either way.
+pub fn run(config: Arc<Mutex<Config>>, start_minimized: bool) {
     let mut apps = match crate::installed_apps::list() {
         Ok(apps) => apps,
         Err(error) => {
-            platform::alert(&format!(
-                "{} {error}",
-                i18n::t(initial_lang, "app_list_fail")
-            ));
+            platform::alert(&format!("{} {error}", t("app_list_fail")));
             Vec::new()
         }
     };
-
-    // Keep a previously saved item visible if it temporarily disappeared from
-    // AppsFolder. This avoids silently changing the configured target merely by
-    // opening and saving the settings window.
+    // Keep bound apps visible even when they disappeared from the folders, so
+    // merely opening the window never silently changes a binding.
     {
-        let c = config.lock().unwrap();
-        if !c.action.app_target.is_empty()
-            && !apps
-                .iter()
-                .any(|app| app.target.eq_ignore_ascii_case(&c.action.app_target))
-        {
-            apps.push(crate::installed_apps::InstalledApp {
-                name: if c.action.app_name.is_empty() {
-                    c.action.app_target.clone()
-                } else {
-                    c.action.app_name.clone()
-                },
-                target: c.action.app_target.clone(),
-                registered: false,
-                icon_rgba: Vec::new(),
-            });
+        let cfg = config.lock().unwrap();
+        for button in DockButton::ALL {
+            let action = cfg.buttons.get(button);
+            if action.kind == ActionKind::App
+                && !action.app_target.is_empty()
+                && !apps
+                    .iter()
+                    .any(|app| app.target.eq_ignore_ascii_case(&action.app_target))
+            {
+                apps.push(InstalledApp {
+                    name: format!("{} (missing)", action.app_name),
+                    target: action.app_target.clone(),
+                    registered: false,
+                    icon_rgba: Vec::new(),
+                });
+            }
         }
     }
-    let apps = Rc::new(apps);
 
     let ui = AppWindow::new().unwrap();
-
-    // Fix CJK tofu: point the default font family at a CJK-capable system font.
-    ui.set_ui_font(default_ui_font().into());
-
-    // Branding: set the in-app header icon from the embedded asset. The window
-    // (title-bar / taskbar) icon is bound to the same image via `icon:` in the
-    // .slint definition. Use the small, pre-anti-aliased asset so the 26x26
-    // header (and 16x16 menu) render without jaggies. No-op if unavailable.
-    if let Some(icon_path) = crate::platform::header_icon_path() {
+    if let Some(icon_path) = platform::header_icon_path() {
         if let Ok(img) = slint::Image::load_from_path(&icon_path) {
-            ui.set_header_icon(img);
+            ui.set_app_icon(img);
         }
     }
-
-    let lang = Rc::new(Cell::new(initial_lang));
-    let feedback_timer = Rc::new(Timer::default());
-
-    // Seed control values from the persisted config.
+    ui.set_version(env!("CARGO_PKG_VERSION").into());
+    ui.set_media_hint(media_hint().into());
+    ui.set_start_hidden_hint(start_hidden_hint().into());
     {
-        let c = config.lock().unwrap();
-        let selected = if c.action.preset_id == "custom" {
-            0
-        } else {
-            crate::installed_apps::selected_index(
-                &apps,
-                &c.action.app_target,
-                &c.action.app_name,
-                &c.action.preset_id,
+        let cfg = config.lock().unwrap();
+        ui.set_device_text(
+            format!(
+                "VID {} · PID {} · usage {}/{}",
+                cfg.device.vendor_id,
+                cfg.device.product_id,
+                cfg.device.usage_page,
+                cfg.device.usage
             )
-            .map(|index| index as i32 + 1)
-            .unwrap_or(0)
-        };
-        ui.set_action_index(selected);
-        ui.set_custom_command(c.action.command.clone().into());
-        ui.set_custom_args(c.action.arguments.clone().into());
-        ui.set_enabled(c.settings.enabled);
-        ui.set_confirm_beep(c.settings.play_confirmation_beep);
-        ui.set_start_windows(autostart::is_enabled());
-        ui.set_minimize(c.settings.minimize_to_tray);
+            .into(),
+        );
+        ui.set_enabled(cfg.settings.enabled);
+        ui.set_confirm_sound(cfg.settings.play_confirmation_beep);
+        ui.set_start_hidden(cfg.settings.start_hidden);
     }
+    ui.set_launch_at_login(autostart::is_enabled());
 
-    select_language(&ui, &lang, &config, &apps, initial_lang);
+    let buttons = platform::supported_buttons();
+    let button_model = Rc::new(VecModel::from(
+        buttons
+            .iter()
+            .map(|b| ButtonEntry {
+                name: b.label().into(),
+                summary: "".into(),
+                icon: button_icon(*b),
+                tint: button_tint(*b),
+            })
+            .collect::<Vec<_>>(),
+    ));
+    ui.set_buttons(ModelRc::from(button_model.clone()));
+    let app_model = Rc::new(VecModel::from(Vec::new()));
+    ui.set_apps(ModelRc::from(app_model.clone()));
 
-    // --- live application-name filtering -----------------------------------
+    let state = Rc::new(State {
+        config: config.clone(),
+        apps,
+        filtered: RefCell::new(Vec::new()),
+        buttons,
+        selected: Cell::new(0),
+        button_model,
+        app_model,
+    });
+    state.refresh_buttons();
+    state.refresh_detail(&ui);
+
+    // ---- callbacks ----------------------------------------------------------
     {
+        let st = state.clone();
         let uiw = ui.as_weak();
-        let lang2 = lang.clone();
-        let apps2 = apps.clone();
-        ui.on_filter_changed(move |query| {
-            if let Some(ui) = uiw.upgrade() {
-                apply_action_filter(&ui, lang2.get(), &apps2, query.as_str());
+        ui.on_button_selected(move |index| {
+            if let (Some(ui), Ok(index)) = (uiw.upgrade(), usize::try_from(index)) {
+                if index < st.buttons.len() {
+                    st.selected.set(index);
+                    st.refresh_detail(&ui);
+                }
             }
         });
     }
+    {
+        let st = state.clone();
+        let uiw = ui.as_weak();
+        ui.on_action_kind_changed(move |index| {
+            let kind = ActionKind::from_index(usize::try_from(index).unwrap_or(0));
+            let button = st.current();
+            st.config.lock().unwrap().buttons.get_mut(button).kind = kind;
+            st.save();
+            st.refresh_buttons();
+            if let Some(ui) = uiw.upgrade() {
+                st.rebuild_apps(&ui, ui.get_app_filter().as_str());
+            }
+        });
+    }
+    {
+        let st = state.clone();
+        let uiw = ui.as_weak();
+        ui.on_app_filter_changed(move |query| {
+            if let Some(ui) = uiw.upgrade() {
+                st.rebuild_apps(&ui, query.as_str());
+            }
+        });
+    }
+    {
+        let st = state.clone();
+        let uiw = ui.as_weak();
+        ui.on_app_selected(move |index| {
+            let Ok(index) = usize::try_from(index) else {
+                return;
+            };
+            let Some(app) = st
+                .filtered
+                .borrow()
+                .get(index)
+                .and_then(|i| st.apps.get(*i))
+                .cloned()
+            else {
+                return;
+            };
+            {
+                let mut cfg = st.config.lock().unwrap();
+                let action = cfg.buttons.get_mut(st.current());
+                action.kind = ActionKind::App;
+                action.app_name = app.name.trim_end_matches(" (missing)").to_string();
+                action.app_target = app.target;
+            }
+            st.save();
+            st.refresh_buttons();
+            if let Some(ui) = uiw.upgrade() {
+                ui.set_selected_app(index as i32);
+            }
+        });
+    }
+    {
+        let st = state.clone();
+        ui.on_command_changed(move |text| {
+            st.config
+                .lock()
+                .unwrap()
+                .buttons
+                .get_mut(st.current())
+                .command = text.to_string();
+            st.save();
+            st.refresh_buttons();
+        });
+    }
+    {
+        let st = state.clone();
+        ui.on_arguments_changed(move |text| {
+            st.config
+                .lock()
+                .unwrap()
+                .buttons
+                .get_mut(st.current())
+                .arguments = text.to_string();
+            st.save();
+        });
+    }
+    {
+        let st = state.clone();
+        ui.on_test_action(move || {
+            let cfg = st.config.lock().unwrap().clone();
+            if let Err(e) = actions::run(cfg.buttons.get(st.current()), &cfg.settings) {
+                platform::alert(&format!("{} {e}", t("action_fail")));
+            }
+        });
+    }
+    {
+        let st = state.clone();
+        let uiw = ui.as_weak();
+        ui.on_setting_changed(move || {
+            let Some(ui) = uiw.upgrade() else {
+                return;
+            };
+            let launch = ui.get_launch_at_login();
+            let hidden = ui.get_start_hidden();
+            {
+                let mut cfg = st.config.lock().unwrap();
+                cfg.settings.enabled = ui.get_enabled();
+                cfg.settings.play_confirmation_beep = ui.get_confirm_sound();
+                cfg.settings.launch_at_login = launch;
+                cfg.settings.start_hidden = hidden;
+            }
+            // The login entry carries `--minimized` too, so a silent start does
+            // not depend on the config file being readable at sign-in.
+            autostart::set_enabled(launch, hidden);
+            st.save();
+        });
+    }
+    ui.on_open_repo(|| {
+        let _ = open::that_detached(REPO_URL);
+    });
+    ui.on_quit_app(|| {
+        platform::request_quit();
+        let _ = slint::quit_event_loop();
+    });
 
-    // The title-bar X always hides the window. Full process exit is deliberately
-    // available only from the menu bar, so closing can never stop monitoring by
-    // accident or because of an obsolete remembered close choice.
+    // The title-bar close button hides the window; the process keeps running
+    // for the tray / menu bar item. Quitting is explicit (About page or menu).
     {
         let uiw = ui.as_weak();
         ui.window().on_close_requested(move || {
@@ -683,164 +873,32 @@ pub fn run(config: Arc<Mutex<Config>>, initial_lang: Lang, start_minimized: bool
         });
     }
 
-    // --- menu-bar exit: stop the resident monitor and the Slint event loop ---
-    {
-        ui.on_quit_app(move || {
-            platform::request_quit();
-            slint::quit_event_loop().ok();
-        });
-    }
-
-    // --- language dropdown selection ----------------------------------------
-    {
-        let uiw = ui.as_weak();
-        let lang2 = lang.clone();
-        let cfg = config.clone();
-        let apps2 = apps.clone();
-        ui.on_lang_chosen(move |idx| {
-            let new_lang = if idx == 0 { Lang::Zh } else { Lang::En };
-            if let Some(ui) = uiw.upgrade() {
-                select_language(&ui, &lang2, &cfg, &apps2, new_lang);
-            }
-        });
-    }
-
-    // --- save ---
-    {
-        let cfg = config.clone();
-        let uiw = ui.as_weak();
-        let lang2 = lang.clone();
-        let ft = feedback_timer.clone();
-        let apps2 = apps.clone();
-        ui.on_save(move || {
-            let ui = uiw.upgrade().unwrap();
-            let mut c = cfg.lock().unwrap();
-            c.version = 2;
-            if ui.get_action_index() == 0 {
-                c.action.app_name.clear();
-                c.action.app_target.clear();
-                c.action.preset_id = "custom".to_string();
-                c.action.command = ui.get_custom_command().to_string();
-                c.action.arguments = ui.get_custom_args().to_string();
-            } else {
-                let Some(app) = selected_app(&apps2, ui.get_action_index()) else {
-                    platform::alert(i18n::t(lang2.get(), "no_app_selected"));
-                    return;
-                };
-                c.action.app_name = app.name.clone();
-                c.action.app_target = app.target.clone();
-                c.action.preset_id = "registered_app".to_string();
-                c.action.command.clear();
-                c.action.arguments.clear();
-            }
-            let start_win = ui.get_start_windows();
-            let start_minimized = ui.get_minimize();
-            c.settings.enabled = ui.get_enabled();
-            c.settings.play_confirmation_beep = ui.get_confirm_beep();
-            c.settings.minimize_to_tray = start_minimized;
-            c.settings.start_with_windows = start_win;
-            c.language = lang2.get().code().to_string();
-            drop(c);
-
-            // The login entry carries `--minimized` too, so a silent start does
-            // not depend on the config file being readable at sign-in.
-            autostart::set_enabled(start_win, start_minimized);
-            match cfg.lock().unwrap().save() {
-                Ok(_) => show_feedback(&ui, &ft, i18n::t(lang2.get(), "saved")),
-                Err(e) => platform::alert(&format!("{} {e}", i18n::t(lang2.get(), "save_fail"))),
-            }
-        });
-    }
-
-    // --- test ---
-    {
-        let cfg = config.clone();
-        let uiw = ui.as_weak();
-        let lang2 = lang.clone();
-        let ft = feedback_timer.clone();
-        let apps2 = apps.clone();
-        ui.on_test(move || {
-            let ui = uiw.upgrade().unwrap();
-            let c = cfg.lock().unwrap();
-            let mut temp = c.clone();
-            if ui.get_action_index() == 0 {
-                temp.action.app_name.clear();
-                temp.action.app_target.clear();
-                temp.action.preset_id = "custom".to_string();
-                temp.action.command = ui.get_custom_command().to_string();
-                temp.action.arguments = ui.get_custom_args().to_string();
-            } else {
-                let Some(app) = selected_app(&apps2, ui.get_action_index()) else {
-                    platform::alert(i18n::t(lang2.get(), "no_app_selected"));
-                    return;
-                };
-                temp.action.app_name = app.name.clone();
-                temp.action.app_target = app.target.clone();
-                temp.action.preset_id = "registered_app".to_string();
-            }
-            drop(c);
-
-            match actions::execute(&temp) {
-                Ok(_) => show_feedback(&ui, &ft, i18n::t(lang2.get(), "test_ok")),
-                Err(e) => platform::alert(&format!("{} {e}", i18n::t(lang2.get(), "test_fail"))),
-            }
-        });
-    }
-
-    // --- deliver monitor events to the UI thread, event-driven ---------------
-    // The resident monitor invokes `on_event` on its own thread for every
-    // `MonitorEvent`. We buffer the event in an `mpsc` channel (so nothing is
-    // lost if the Slint event loop is not ready yet — `invoke_from_event_loop`
-    // returns `Err` before the loop starts) and then ask the Slint event loop
-    // to drain the channel on the UI thread via `invoke_from_event_loop`.
-    //
-    // This replaces the old 200 ms `Timer::Repeated` poll: with no active timer,
-    // the winit event loop can block in its message wait and the UI thread idles
-    // at ~0% CPU when nothing happens.
+    // ---- monitor events, event-driven ----------------------------------------
+    // Events are buffered in a channel (so nothing is lost before the loop
+    // starts) and drained on the UI thread via `invoke_from_event_loop`.
     let (tx, rx) = mpsc::channel::<MonitorEvent>();
     let rx = Arc::new(Mutex::new(rx));
     let ui_weak = ui.as_weak();
     let on_event = {
-        let tx = tx;
         let rx = rx.clone();
         let ui_weak = ui_weak.clone();
-        let config = config.clone();
         move |ev: MonitorEvent| {
-            // Buffer first so the event survives a not-yet-running loop.
             let _ = tx.send(ev);
             let rx = rx.clone();
             let ui_weak = ui_weak.clone();
-            let config = config.clone();
-            let _ = invoke_from_event_loop(move || {
-                pump_events(&rx, &ui_weak, &config);
-            });
+            let _ = invoke_from_event_loop(move || pump_events(&rx, &ui_weak));
         }
     };
     platform::start_monitor(on_event, config.clone());
-
-    // Flush any events that arrived before the event loop was ready (notably the
-    // monitor's initial device-status broadcast sent during startup). A one-shot
-    // timer fires exactly once after the loop starts and then disarms, so it does
-    // not keep the loop awake the way the old repeating timer did.
     {
         let rx = rx.clone();
         let ui_weak = ui_weak.clone();
-        let config = config.clone();
         let flush = Timer::default();
         flush.start(TimerMode::SingleShot, Duration::from_millis(0), move || {
-            pump_events(&rx, &ui_weak, &config);
+            pump_events(&rx, &ui_weak);
         });
     }
 
-    // Run the event loop "until quit": hiding the window (minimize-to-tray)
-    // must NOT terminate the app — our Win32 tray keeps it alive. Only an
-    // explicit menu-bar Exit ends the loop.
-    //
-    // With "start minimized to the tray" the window is never shown in the first
-    // place. The monitor and the tray icon are already up by now, so the app
-    // comes up resident-only and the user opens the settings window by
-    // double-clicking the tray icon. `run_event_loop_until_quit` is documented
-    // for exactly this daemon-style case (keeps running with nothing visible).
     let outcome = if start_minimized {
         slint::run_event_loop_until_quit()
     } else {
@@ -849,182 +907,50 @@ pub fn run(config: Arc<Mutex<Config>>, initial_lang: Lang, start_minimized: bool
             .and_then(|()| slint::run_event_loop_until_quit())
     };
     if let Err(error) = outcome {
-        handle_backend_failure(&error, ui_lang(&config));
+        handle_backend_failure(&error);
     }
 }
 
-/// Slint's default renderer needs a working OpenGL driver. Machines without one
-/// (remote-desktop sessions, VMs, very old GPUs) fail *inside* `show()` /
-/// `run_event_loop_until_quit`, which used to be swallowed with `.ok()` — the
-/// process then returned from `main` with exit code 0 and, having no console,
-/// simply vanished with no explanation at all.
-///
-/// The software renderer is compiled in, so try to recover by re-running
-/// ourselves with it forced on, and only report the failure when that is not an
-/// option any more.
-fn handle_backend_failure(error: &slint::PlatformError, lang: Lang) {
-    if relaunch_with_software_renderer() {
-        return;
-    }
-    platform::alert(&format!("{} {error}", i18n::t(lang, "render_fail")));
-}
-
-/// The Slint backend/renderer combination that needs no GPU driver.
-const SOFTWARE_BACKEND: &str = "winit-software";
-
-/// Re-executes this process with the software renderer forced on, handing over
-/// the tray icon and the single-instance slot first.
-///
-/// Returns false — meaning "report the error instead" — when a backend was
-/// already pinned (so a still-broken relaunch can never loop) or when the
-/// replacement process could not be started.
-fn relaunch_with_software_renderer() -> bool {
-    if std::env::var_os("SLINT_BACKEND").is_some() {
-        return false;
-    }
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-    // Stop the monitor thread first: it removes its tray icon and destroys its
-    // window before returning, so the replacement process does not end up
-    // sitting next to a dead icon. Then drop the single-instance mutex, or the
-    // replacement would report itself as "already running".
-    platform::request_quit();
-    platform::release_single_instance();
-    std::process::Command::new(exe)
-        .args(std::env::args_os().skip(1))
-        .env("SLINT_BACKEND", SOFTWARE_BACKEND)
-        .spawn()
-        .is_ok()
-}
-
-/// Applies `new_lang` everywhere: persists the choice and re-localizes all
-/// strings plus the application picker model without changing its selection.
-fn select_language(
-    ui: &AppWindow,
-    lang: &Rc<Cell<Lang>>,
-    config: &Arc<Mutex<Config>>,
-    apps: &[crate::installed_apps::InstalledApp],
-    new_lang: Lang,
-) {
-    lang.set(new_lang);
-    {
-        let mut c = config.lock().unwrap();
-        c.language = new_lang.code().to_string();
-        let _ = c.save();
-    }
-    relocalize(ui, new_lang, apps);
-    ui.set_lang_index(if new_lang == Lang::Zh { 0 } else { 1 });
-}
-
-/// Re-applies every localized string + the application picker and language menu
-/// models for `lang`. Running counters are read back from the Slint properties
-/// (`presses-count`, `status-count`, `last-text`) so a language switch repaints
-/// them without needing any Rust-side shared state.
-fn relocalize(ui: &AppWindow, lang: Lang, apps: &[crate::installed_apps::InstalledApp]) {
-    ui.set_window_title(i18n::t(lang, "app_title").into());
-    ui.set_subtitle_text(i18n::t(lang, "subtitle").into());
-
-    let status = if ui.get_status_count() > 0 {
-        format!(
-            "{}{}",
-            i18n::t(lang, "status_prefix"),
-            i18n::t(lang, "status_connected")
-        )
+fn media_hint() -> &'static str {
+    if platform::supported_buttons().len() > 1 {
+        "The system keeps its built-in behavior for the media keys; your action runs in addition. \
+         The Teams key is ignored by the system, which makes it the natural one to remap."
     } else {
-        format!(
-            "{}{}",
-            i18n::t(lang, "status_prefix"),
-            i18n::t(lang, "status_disconnected")
-        )
+        "On Windows only the Teams key can be observed by this app."
+    }
+}
+
+fn start_hidden_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Show only the menu bar icon at launch"
+    } else {
+        "Show only the tray icon at launch"
+    }
+}
+
+fn button_icon(button: DockButton) -> slint::Image {
+    let svg: &[u8] = match button {
+        DockButton::Teams => include_bytes!("../public/icons/teams.svg"),
+        DockButton::PlayPause => include_bytes!("../public/icons/play-pause.svg"),
+        DockButton::VolumeDown => include_bytes!("../public/icons/volume-down.svg"),
+        DockButton::VolumeUp => include_bytes!("../public/icons/volume-up.svg"),
+        DockButton::MicMute => include_bytes!("../public/icons/mic.svg"),
     };
-    ui.set_status_text(status.into());
-    ui.set_collections_text(
-        format!("{}{}", i18n::t(lang, "collections"), ui.get_status_count()).into(),
-    );
-    ui.set_presses_text(format!("{}{}", i18n::t(lang, "presses"), ui.get_presses_count()).into());
-    ui.set_last_text(ui.get_last_text());
-
-    ui.set_action_label(i18n::t(lang, "action_label").into());
-    ui.set_action_filter("".into());
-    apply_action_filter(ui, lang, apps, "");
-    let registered_count = apps.iter().filter(|app| app.registered).count();
-    ui.set_app_list_hint(
-        format!("{}{}", i18n::t(lang, "apps_folder_count"), registered_count).into(),
-    );
-    ui.set_custom_command_label(i18n::t(lang, "custom_command").into());
-    ui.set_custom_args_label(i18n::t(lang, "custom_args").into());
-    ui.set_search_placeholder(i18n::t(lang, "search_apps").into());
-    ui.set_opt_enabled(i18n::t(lang, "opt_enabled").into());
-    ui.set_opt_beep(i18n::t(lang, "opt_beep").into());
-    ui.set_opt_autostart(i18n::t(lang, "opt_autostart").into());
-    ui.set_opt_minimize(i18n::t(lang, "opt_minimize").into());
-    ui.set_lang_button_label(i18n::t(lang, "lang_button").into());
-    ui.set_exit_button_label(i18n::t(lang, "menu_exit").into());
-
-    // Language menu lists native names so it is readable in either language.
-    let lang_model = Rc::new(VecModel::from(vec![
-        Lang::Zh.label().to_string().into(),
-        Lang::En.label().to_string().into(),
-    ]));
-    ui.set_lang_model(lang_model.into());
-
-    ui.set_btn_save(i18n::t(lang, "btn_save").into());
-    ui.set_btn_test(i18n::t(lang, "btn_test").into());
-    ui.set_hint_text(i18n::t(lang, "hint_tray").into());
+    slint::Image::load_from_svg_data(svg).unwrap_or_default()
 }
 
-fn apply_action_filter(
-    ui: &AppWindow,
-    lang: Lang,
-    apps: &[crate::installed_apps::InstalledApp],
-    query: &str,
-) {
-    let mut visible_count = 1;
-    let mut action_model = vec![AppChoice {
-        name: i18n::t(lang, "preset_custom").into(),
-        icon: ui.get_header_icon(),
-        visible: true,
-    }];
-    action_model.extend(apps.iter().map(|app| {
-        let visible = app_matches_filter(&app.name, query);
-        if visible {
-            visible_count += 1;
-        }
-        AppChoice {
-            name: if app.registered {
-                app.name.clone().into()
-            } else {
-                format!(
-                    "{} ({})",
-                    app.name,
-                    i18n::t(lang, "app_no_longer_registered")
-                )
-                .into()
-            },
-            icon: app_icon(app),
-            visible,
-        }
-    }));
-    ui.set_action_visible_count(visible_count);
-    ui.set_action_model(Rc::new(VecModel::from(action_model)).into());
+fn button_tint(button: DockButton) -> slint::Color {
+    let argb = match button {
+        DockButton::Teams => 0xff5b5fc7,
+        DockButton::PlayPause => 0xffff9f0a,
+        DockButton::VolumeDown => 0xff30b0c7,
+        DockButton::VolumeUp => 0xff30b0c7,
+        DockButton::MicMute => 0xffff3b30,
+    };
+    slint::Color::from_argb_encoded(argb)
 }
 
-fn app_matches_filter(name: &str, query: &str) -> bool {
-    let normalized_query = query.trim().to_lowercase();
-    normalized_query.is_empty() || name.to_lowercase().contains(&normalized_query)
-}
-
-fn selected_app(
-    apps: &[crate::installed_apps::InstalledApp],
-    index: i32,
-) -> Option<&crate::installed_apps::InstalledApp> {
-    usize::try_from(index - 1)
-        .ok()
-        .and_then(|index| apps.get(index))
-}
-
-fn app_icon(app: &crate::installed_apps::InstalledApp) -> slint::Image {
+fn app_icon(app: &InstalledApp) -> slint::Image {
     const ICON_SIZE: u32 = 32;
     if app.icon_rgba.len() != (ICON_SIZE * ICON_SIZE * 4) as usize {
         return slint::Image::default();
@@ -1034,133 +960,63 @@ fn app_icon(app: &crate::installed_apps::InstalledApp) -> slint::Image {
     slint::Image::from_rgba8_premultiplied(buffer)
 }
 
-/// Shows a transient confirmation message that auto-clears after ~2s.
-fn show_feedback(ui: &AppWindow, timer: &Rc<Timer>, msg: &str) {
-    let uiw = ui.as_weak();
-    ui.set_feedback_text(msg.into());
-    ui.set_feedback_visible(true);
-    let timer = timer.clone();
-    timer.start(
-        TimerMode::SingleShot,
-        Duration::from_millis(2200),
-        move || {
-            if let Some(ui) = uiw.upgrade() {
-                ui.set_feedback_visible(false);
-                ui.set_feedback_text("".into());
-            }
-        },
-    );
-}
-
-/// Candidate CJK-capable fonts: a single-face `.ttf`/`.otf` is preferred over a
-/// `.ttc` collection (more reliably parsed by the font loader). First existing
-/// file wins.
-const FONT_CANDIDATES: &[(&str, &str)] = &[
-    ("C:\\Windows\\Fonts\\simhei.ttf", "SimHei"),
-    (
-        "C:\\Windows\\Fonts\\NotoSansCJKsc-Regular.otf",
-        "Noto Sans CJK SC",
-    ),
-    ("C:\\Windows\\Fonts\\msyh.ttc", "Microsoft YaHei"),
-    ("C:\\Windows\\Fonts\\simsun.ttc", "SimSun"),
-];
-
-/// Picks a CJK-capable system font *family name* so Chinese renders instead of
-/// tofu. Used as the per-`Text` `font-family` binding (a belt-and-suspenders
-/// measure alongside the global `SLINT_DEFAULT_FONT` set in `set_default_cjk_font`).
-fn default_ui_font() -> String {
-    // macOS: the system font stack (San Francisco + PingFang fallback) already
-    // renders CJK, so leave the family at Slint's default.
-    if cfg!(target_os = "macos") {
-        return String::new();
-    }
-    for (file, family) in FONT_CANDIDATES {
-        if std::path::Path::new(file).exists() {
-            return family.to_string();
-        }
-    }
-    "Microsoft YaHei".to_string()
-}
-
-/// First existing CJK font *file path*, used to set the `SLINT_DEFAULT_FONT`
-/// env var (read once when the Slint font collection is created). Returns None
-/// when no candidate is present, letting Slint fall back to system fonts.
-fn default_ui_font_path() -> Option<String> {
-    for (file, _) in FONT_CANDIDATES {
-        if std::path::Path::new(file).exists() {
-            return Some(file.to_string());
-        }
-    }
-    None
-}
-
-/// Makes the global default UI font a CJK-capable one so *all* text — including
-/// `CheckBox`/`ComboBox` widget labels and dropdown items — renders Chinese
-/// instead of tofu. Must run before the first Slint window is created.
-fn set_default_cjk_font() {
-    if cfg!(target_os = "macos") {
+/// Slint's default renderer needs a working GPU driver. Machines without one
+/// fail inside `show()` / `run_event_loop_until_quit`; the software renderer
+/// is compiled in, so try once more with it forced on before giving up.
+fn handle_backend_failure(error: &slint::PlatformError) {
+    if relaunch_with_software_renderer() {
         return;
     }
-    if let Some(path) = default_ui_font_path() {
-        std::env::set_var("SLINT_DEFAULT_FONT", path);
+    platform::alert(&format!("{} {error}", t("render_fail")));
+}
+
+const SOFTWARE_BACKEND: &str = "winit-software";
+
+/// Re-executes this process with the software renderer forced on, handing
+/// over the tray icon and the single-instance slot first. False when a backend
+/// was already pinned (so a still-broken relaunch never loops) or the
+/// replacement could not be started.
+fn relaunch_with_software_renderer() -> bool {
+    if std::env::var_os("SLINT_BACKEND").is_some() {
+        return false;
     }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    platform::request_quit();
+    platform::release_single_instance();
+    std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env("SLINT_BACKEND", SOFTWARE_BACKEND)
+        .spawn()
+        .is_ok()
 }
 
 fn now_hms() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
-/// Drains every buffered `MonitorEvent` and applies it on the UI thread. Called
-/// from `slint::invoke_from_event_loop` (per event) and once from a one-shot
-/// timer (to flush events that arrived before the loop was ready). All state it
-/// touches is `Send` (a `Weak<AppWindow>`, an `Arc<Mutex<Receiver>>` buffer, and
-/// `Arc<Mutex<Config>>`), so this is safe to run inside the `Send` closure.
-fn pump_events(
-    rx: &Arc<Mutex<Receiver<MonitorEvent>>>,
-    ui_weak: &Weak<AppWindow>,
-    config: &Arc<Mutex<Config>>,
-) {
+/// Drains every buffered `MonitorEvent` on the UI thread.
+fn pump_events(rx: &Arc<Mutex<Receiver<MonitorEvent>>>, ui_weak: &Weak<AppWindow>) {
     let Some(ui) = ui_weak.upgrade() else {
         return;
     };
-    loop {
-        let ev = match rx.lock().unwrap().try_recv() {
-            Ok(ev) => ev,
-            Err(_) => break,
-        };
-        apply_event(&ui, config, ev);
+    while let Ok(ev) = rx.lock().unwrap().try_recv() {
+        apply_event(&ui, ev);
     }
 }
 
-/// Applies a single `MonitorEvent` to the UI. Running counters live in Slint
-/// `int`/`string` properties so this function needs no `!Send` Rust state.
-fn apply_event(ui: &AppWindow, config: &Arc<Mutex<Config>>, ev: MonitorEvent) {
-    let lang = ui_lang(config);
+fn apply_event(ui: &AppWindow, ev: MonitorEvent) {
     match ev {
-        MonitorEvent::Press => {
-            let n = ui.get_presses_count() + 1;
-            ui.set_presses_count(n);
-            ui.set_presses_text(format!("{}{}", i18n::t(lang, "presses"), n).into());
-            let last = now_hms();
-            ui.set_last_text(format!("{}{}", i18n::t(lang, "last"), last).into());
+        MonitorEvent::Press(button) => {
+            ui.set_last_press_text(
+                format!("Last press: {} at {}", button.label(), now_hms()).into(),
+            );
         }
         MonitorEvent::Status(n) => {
-            ui.set_status_count(n as i32);
-            let status = if n > 0 {
-                format!(
-                    "{}{}",
-                    i18n::t(lang, "status_prefix"),
-                    i18n::t(lang, "status_connected")
-                )
-            } else {
-                format!(
-                    "{}{}",
-                    i18n::t(lang, "status_prefix"),
-                    i18n::t(lang, "status_disconnected")
-                )
-            };
-            ui.set_status_text(status.into());
-            ui.set_collections_text(format!("{}{}", i18n::t(lang, "collections"), n).into());
+            ui.set_connected(n > 0);
+            ui.set_status_text(if n > 0 { "Connected" } else { "Not connected" }.into());
+            ui.set_collections_text(n.to_string().into());
         }
         MonitorEvent::TrayShow => {
             let _ = ui.show();
@@ -1169,28 +1025,5 @@ fn apply_event(ui: &AppWindow, config: &Arc<Mutex<Config>>, ev: MonitorEvent) {
             platform::request_quit();
             let _ = slint::quit_event_loop();
         }
-    }
-}
-
-/// Resolves the active UI language from the persisted config (single source of
-/// truth), used by the event handler so it does not need to capture the
-/// UI-thread-only `Rc<Cell<Lang>>`.
-fn ui_lang(config: &Arc<Mutex<Config>>) -> Lang {
-    Lang::resolve(&config.lock().unwrap().language)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::app_matches_filter;
-
-    #[test]
-    fn app_filter_is_case_insensitive_and_trims_input() {
-        assert!(app_matches_filter("Microsoft Teams", "  TEAMS "));
-        assert!(!app_matches_filter("Microsoft Teams", "Zoom"));
-    }
-
-    #[test]
-    fn empty_filter_keeps_every_app_visible() {
-        assert!(app_matches_filter("计算器", "  "));
     }
 }

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::config::Config;
+use crate::config::{Button, Config};
 
 // App icon, embedded at compile time and materialized to a temp file at runtime
 // so both the Slint window (ICO) and the in-app header (PNG) can load it.
@@ -76,8 +76,9 @@ use self::windows as backend;
 /// across Windows / Linux / macOS.
 #[derive(Debug, Clone)]
 pub enum MonitorEvent {
-    /// A Teams-key press was detected (stats update).
-    Press,
+    /// A Dock button was pressed (the action itself runs on the backend's
+    /// worker; this only updates the UI).
+    Press(Button),
     /// Candidate Dock collections currently registered.
     Status(u32),
     /// Tray icon requested the settings window.
@@ -129,6 +130,12 @@ pub fn ensure_single_instance() -> bool {
 /// displays (notably the "already running" MessageBox shown before the UI loop).
 pub fn set_dpi_aware() {
     backend::set_dpi_aware();
+}
+
+/// The Dock buttons this backend can observe. Windows registers only the
+/// Teams collection with Raw Input; macOS reads the whole interface.
+pub fn supported_buttons() -> &'static [Button] {
+    backend::supported_buttons()
 }
 
 /// Whether a login entry for this app currently exists.

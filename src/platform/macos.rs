@@ -4,10 +4,18 @@
 //! file lock.
 //!
 //! macOS exposes the whole Dock HID interface through one device handle rather
-//! than one handle per top-level collection as Windows does, so the Teams key
-//! is recognised by its report ID (0x9B) instead of by usage page. The report
-//! layout itself is identical to Windows: `9B 01` on press, `9B 00` on release
-//! (verified against a real Dock, VID 045E / PID 084D, on macOS 26).
+//! than one handle per top-level collection as Windows does, so every button
+//! arrives on the same read and is told apart by report ID. Verified against a
+//! real Dock (VID 045E / PID 084D) on macOS 26:
+//!
+//! | report ID | collection            | press report | button          |
+//! |-----------|-----------------------|--------------|-----------------|
+//! | 0x9B      | vendor FF99 / 0001    | `9B 01`      | Teams           |
+//! | 0x01      | consumer control      | `01 01`/`01 02` | volume up / down |
+//! | 0x04      | consumer control      | `04 08`      | play / pause    |
+//! | 0x08      | telephony             | `08 01`/`08 00` | mic mute (latched) |
+//!
+//! The Teams report is byte-identical to what the Windows backend sees.
 
 use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
@@ -25,13 +33,19 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::autostart::MINIMIZED_FLAG;
-use crate::config::{Config, DeviceFilter};
-use crate::i18n::{self, Lang};
+use crate::config::{Button, Config, DeviceFilter};
+use crate::i18n;
 use crate::platform::MonitorEvent;
 
 /// Report ID of the Teams-key input report inside the Dock's vendor collection
 /// (usage page FF99, usage 0001).
 const TEAMS_REPORT_ID: u8 = 0x9B;
+/// Consumer-control report carrying volume increment (bit 0) / decrement (bit 1).
+const VOLUME_REPORT_ID: u8 = 0x01;
+/// Consumer-control report carrying play/pause (bit 3).
+const MEDIA_REPORT_ID: u8 = 0x04;
+/// Telephony report carrying the latched phone-mute state (bit 0).
+const TELEPHONY_REPORT_ID: u8 = 0x08;
 /// How often the monitor re-scans for the Dock while it is unplugged.
 const RESCAN_INTERVAL: Duration = Duration::from_secs(1);
 /// Read timeout: bounds how long a quit request waits for the read loop.
@@ -57,8 +71,9 @@ fn emit(on_event: &SharedOnEvent, event: MonitorEvent) {
     (*callback)(event);
 }
 
-fn lang_of(config: &Arc<Mutex<Config>>) -> Lang {
-    Lang::resolve(&config.lock().unwrap().language)
+/// Every Dock button is visible on the shared interface.
+pub fn supported_buttons() -> &'static [Button] {
+    &Button::ALL
 }
 
 /// Starts the resident monitor: the menu bar item (main thread), the action
@@ -69,16 +84,15 @@ pub fn start_monitor(on_event: impl Fn(MonitorEvent) + Send + 'static, config: A
     QUIT.store(false, Ordering::SeqCst);
     let on_event: SharedOnEvent = Arc::new(Mutex::new(Box::new(on_event)));
 
-    install_status_item(on_event.clone(), &config);
+    install_status_item(on_event.clone());
 
     // Actions run off the monitor thread so a slow launch never delays the
     // next report, mirroring the Windows backend.
-    let (action_tx, action_rx) = mpsc::channel::<Config>();
+    let (action_tx, action_rx) = mpsc::channel::<(Button, Config)>();
     thread::spawn(move || {
-        while let Ok(cfg) = action_rx.recv() {
-            if let Err(e) = crate::actions::execute(&cfg) {
-                let lang = Lang::resolve(&cfg.language);
-                alert(&format!("{} {e}", i18n::t(lang, "action_fail")));
+        while let Ok((button, cfg)) = action_rx.recv() {
+            if let Err(e) = crate::actions::run(cfg.buttons.get(button), &cfg.settings) {
+                alert(&format!("{} {e}", i18n::t("action_fail")));
             }
         }
     });
@@ -94,11 +108,15 @@ pub fn start_monitor(on_event: impl Fn(MonitorEvent) + Send + 'static, config: A
 
 /// Re-scans for the Dock, reads it until it goes away, repeats. Hot-plug is
 /// handled by the outer loop: a read error means the device was removed.
-fn monitor_loop(on_event: SharedOnEvent, config: Arc<Mutex<Config>>, action_tx: Sender<Config>) {
+fn monitor_loop(
+    on_event: SharedOnEvent,
+    config: Arc<Mutex<Config>>,
+    action_tx: Sender<(Button, Config)>,
+) {
     let mut api = match HidApi::new() {
         Ok(api) => api,
         Err(e) => {
-            alert(&format!("{} {e}", i18n::t(lang_of(&config), "init_fail")));
+            alert(&format!("{} {e}", i18n::t("init_fail")));
             emit(&on_event, MonitorEvent::Status(0));
             return;
         }
@@ -115,6 +133,7 @@ fn monitor_loop(on_event: SharedOnEvent, config: Arc<Mutex<Config>>, action_tx: 
                     .collect();
                 let count = matching.len() as u32;
                 if last_status != Some(count) {
+                    eprintln!("[ms-audio-dock-remapper] matching Dock collections: {count}");
                     emit(&on_event, MonitorEvent::Status(count));
                     last_status = Some(count);
                 }
@@ -159,20 +178,20 @@ fn read_reports(
     device: &HidDevice,
     on_event: &SharedOnEvent,
     config: &Arc<Mutex<Config>>,
-    action_tx: &Sender<Config>,
+    action_tx: &Sender<(Button, Config)>,
 ) {
     let mut buf = [0u8; 64];
     while !QUIT.load(Ordering::SeqCst) {
         match device.read_timeout(&mut buf, READ_TIMEOUT_MS) {
             Ok(0) => {}
             Ok(n) => {
-                if let Some(false) = match_teams(&buf[..n]) {
-                    emit(on_event, MonitorEvent::Press);
+                if let Some(button) = match_press(&buf[..n]) {
+                    emit(on_event, MonitorEvent::Press(button));
                     // Clone, then release the lock before handing the action
                     // to the worker; never hold the config mutex across a launch.
                     let cfg = config.lock().unwrap().clone();
                     if cfg.settings.enabled {
-                        let _ = action_tx.send(cfg);
+                        let _ = action_tx.send((button, cfg));
                     }
                 }
             }
@@ -181,15 +200,19 @@ fn read_reports(
     }
 }
 
-/// Returns `Some(is_release)` for a Teams-key report, `None` for any other
-/// report the shared interface delivers (volume, media, telephony, ...).
-fn match_teams(report: &[u8]) -> Option<bool> {
-    if report.len() < 2 || report[0] != TEAMS_REPORT_ID {
+/// Maps an input report to the button whose *press* it announces. Releases
+/// (`xx 00`) and unrelated reports yield `None`. The telephony mute report is
+/// a latched state, so both transitions count as a press: each one is a tap.
+fn match_press(report: &[u8]) -> Option<Button> {
+    if report.len() < 2 {
         return None;
     }
-    match report[1] {
-        0x01 => Some(false),
-        0x00 => Some(true),
+    match (report[0], report[1]) {
+        (TEAMS_REPORT_ID, 0x01) => Some(Button::Teams),
+        (VOLUME_REPORT_ID, bits) if bits & 0x01 != 0 => Some(Button::VolumeUp),
+        (VOLUME_REPORT_ID, bits) if bits & 0x02 != 0 => Some(Button::VolumeDown),
+        (MEDIA_REPORT_ID, bits) if bits & 0x08 != 0 => Some(Button::PlayPause),
+        (TELEPHONY_REPORT_ID, _) => Some(Button::MicMute),
         _ => None,
     }
 }
@@ -205,11 +228,10 @@ fn sleep_unless_quit(total: Duration) {
 
 // --- menu bar status item ----------------------------------------------------
 
-fn install_status_item(on_event: SharedOnEvent, config: &Arc<Mutex<Config>>) {
-    let lang = lang_of(config);
+fn install_status_item(on_event: SharedOnEvent) {
     let menu = Menu::new();
-    let open_item = MenuItem::new(i18n::t(lang, "tray_open"), true, None);
-    let quit_item = MenuItem::new(i18n::t(lang, "menu_exit"), true, None);
+    let open_item = MenuItem::new(i18n::t("tray_open"), true, None);
+    let quit_item = MenuItem::new(i18n::t("menu_exit"), true, None);
     if let Err(e) = menu.append_items(&[&open_item, &PredefinedMenuItem::separator(), &quit_item]) {
         eprintln!("[ms-audio-dock-remapper] status menu unavailable: {e}");
         return;
@@ -383,7 +405,8 @@ fn xml_escape(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{match_teams, status_icon};
+    use super::{match_press, status_icon};
+    use crate::config::Button;
 
     #[test]
     fn embedded_header_png_decodes_into_a_status_icon() {
@@ -394,16 +417,22 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_the_dock_teams_report() {
-        assert_eq!(match_teams(&[0x9B, 0x01]), Some(false));
-        assert_eq!(match_teams(&[0x9B, 0x00]), Some(true));
+    fn maps_every_captured_press_report_to_its_button() {
+        assert_eq!(match_press(&[0x9B, 0x01]), Some(Button::Teams));
+        assert_eq!(match_press(&[0x04, 0x08]), Some(Button::PlayPause));
+        assert_eq!(match_press(&[0x01, 0x02]), Some(Button::VolumeDown));
+        assert_eq!(match_press(&[0x01, 0x01]), Some(Button::VolumeUp));
+        assert_eq!(match_press(&[0x08, 0x01]), Some(Button::MicMute));
+        // Latched state: the unmute tap reports 00 and is a press too.
+        assert_eq!(match_press(&[0x08, 0x00]), Some(Button::MicMute));
     }
 
     #[test]
-    fn ignores_other_collections_on_the_shared_interface() {
-        assert_eq!(match_teams(&[0x01, 0x01]), None); // volume up
-        assert_eq!(match_teams(&[0x04, 0x08]), None); // play/pause
-        assert_eq!(match_teams(&[0x08, 0x01]), None); // telephony mute
-        assert_eq!(match_teams(&[0x9B]), None);
+    fn ignores_releases_and_unknown_reports() {
+        assert_eq!(match_press(&[0x9B, 0x00]), None);
+        assert_eq!(match_press(&[0x01, 0x00]), None);
+        assert_eq!(match_press(&[0x04, 0x00]), None);
+        assert_eq!(match_press(&[0x39, 0x20, 0x01]), None);
+        assert_eq!(match_press(&[0x9B]), None);
     }
 }

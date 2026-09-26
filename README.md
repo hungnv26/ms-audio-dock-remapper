@@ -18,16 +18,22 @@ administrator privileges.
 
 ## What it can do
 
-- Launch any desktop or Microsoft Store application registered with Windows.
+- Bind an action to the Teams key, and on macOS to every button on the Dock
+  (Teams, play/pause, volume down, volume up, microphone mute).
+- Launch any installed application: desktop or Microsoft Store apps registered
+  with Windows, `.app` bundles from the Applications folders on macOS.
 - Run a custom executable, open a URL, or invoke another shell-supported
   target.
-- Search the installed application list by name and see the native Windows
-  icon for each application.
-- Test an action before saving it.
+- Search the installed application list by name and see each application's
+  native icon.
+- Try an action from the settings window; every change applies immediately.
 - Play an optional confirmation sound after a successful trigger.
-- Start automatically when you sign in to Windows.
-- Continue listening from the system tray after the settings window is closed.
-- Display its interface in English or Chinese.
+- Start automatically at sign-in / login, optionally hidden.
+- Continue listening from the system tray (Windows) or the menu bar (macOS)
+  after the settings window is closed.
+
+The settings window follows the layout of macOS System Settings: a sidebar
+with Buttons, General and About sections, and grouped rows on the right.
 
 ## How it works
 
@@ -77,37 +83,34 @@ license together in one ZIP archive.
 1. Connect the Microsoft Audio Dock to your computer.
 2. Install the app or extract the portable package, then start
    **MS Audio Dock Remapper**.
-3. Open the action list under **When the Teams key is pressed**.
-4. Search for and select any application registered with Windows.
-5. Alternatively, select **Custom program** at the top of the list and enter a
-   command, executable path, URL, and optional arguments.
-6. Select **Test action** to confirm that the target opens correctly.
-7. Select **Save**.
-8. Press the Teams button on the Dock.
+3. In the **Buttons** section, select the button you want to change (Teams on
+   Windows; any of the five buttons on macOS).
+4. Under **When pressed**, choose **Open an application** and pick one from
+   the searchable list, or choose **Open a URL or run a command** and enter a
+   URL, a program path and optional arguments.
+5. Select **Test** to confirm the action works, then press the button on the
+   Dock.
 
-The status area shows whether the Dock is detected, how many matching input
-collections are registered, and the most recent trigger.
+Changes apply and save immediately. The sidebar shows whether the Dock is
+connected; the **About** section lists the device identity and the number of
+matching input collections, and the Buttons section shows the most recent
+press.
 
 ## Running in the background
 
-Closing the settings window hides it in the system tray; it does not stop the
-remapper. Double-click the tray icon to reopen the window. Use **Exit** in the
-application menu when you want to stop the remapper completely.
+Closing the settings window hides it; it does not stop the remapper. Reopen it
+from the tray icon (double-click on Windows) or the menu bar icon (macOS).
+Quit from the tray / menu bar menu or from the **About** section.
 
-You can also enable:
+The **General** section offers:
 
-- **Launch at Windows sign-in**
-- **Start minimized to the tray**
-- **Play confirmation sound on trigger**
-- **Enable key remapping**
-
-With **Start minimized to the tray** enabled the application starts tray-only:
-the settings window is not shown at all, while key monitoring runs as usual.
-Double-click the tray icon to open the window. Combined with **Launch at Windows
-sign-in** this gives a silent background start after boot — the sign-in entry is
-registered as `"…\ms-audio-dock-remapper.exe" --minimized`, so the silent start
-also holds when the configuration file cannot be read. You can pass
-`--minimized` to a shortcut of your own for the same effect.
+- **Run button actions** — pause all remapping without quitting.
+- **Confirmation sound** — play a short sound after an action runs.
+- **Launch at login** — register a per-user login entry.
+- **Start hidden** — start with only the tray / menu bar icon; the login entry
+  then carries `--minimized`, so the silent start also holds when the
+  configuration file cannot be read. You can pass `--minimized` to a shortcut
+  of your own for the same effect.
 
 Only one instance of the application can run at a time.
 
@@ -116,17 +119,13 @@ Only one instance of the application can run at a time.
 Settings are saved locally as readable JSON at:
 
 ```text
-%APPDATA%\ms-audio-dock-remapper\config.json
+%APPDATA%\ms-audio-dock-remapper\config.json                       (Windows)
+~/Library/Application Support/ms-audio-dock-remapper/config.json   (macOS)
 ```
 
-The application does not need administrator privileges and does not modify the
-Audio Dock firmware or driver.
-
-## Language
-
-The interface follows the Windows UI language on first launch. English and
-Chinese can also be selected directly from the application menu, and the
-selection is remembered.
+Files written by earlier versions (one action for the Teams key) are migrated
+automatically. The application does not need administrator privileges and does
+not modify the Audio Dock firmware or driver.
 
 ## macOS
 

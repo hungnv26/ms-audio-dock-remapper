@@ -1,6 +1,5 @@
-use crate::config::Config;
+use crate::config::{ActionKind, ButtonAction, Settings};
 use crate::installed_apps;
-use crate::presets;
 
 /// Plays the platform's default notification sound (Windows `MessageBeep`, a
 /// system sound through `afplay` on macOS). Elsewhere this is a no-op.
@@ -35,8 +34,9 @@ pub fn beep() {
 /// handled: `open` (cross-platform) opens them via the OS shell, while custom
 /// commands with arguments go through `std::process::Command`.
 pub fn launch(command: &str, args: &str) -> Result<(), String> {
+    let command = command.trim();
     if command.is_empty() {
-        return Err("未配置启动命令".into());
+        return Err("No command or URL is configured".into());
     }
 
     if args.trim().is_empty() {
@@ -50,62 +50,26 @@ pub fn launch(command: &str, args: &str) -> Result<(), String> {
     }
 }
 
-/// Resolves the first installed executable among the hints, or None.
-pub fn resolve_executable(preset: &presets::Preset) -> Option<String> {
-    for hint in preset.exe_hints {
-        let expanded = expand_env(hint);
-        if std::path::Path::new(&expanded).exists() {
-            return Some(expanded);
-        }
-    }
-    None
-}
-
-fn expand_env(path: &str) -> String {
-    // Minimal %VAR% expansion (Windows-style); harmless elsewhere.
-    let mut result = path.to_string();
-    for (key, val) in [("LOCALAPPDATA", "LOCALAPPDATA"), ("APPDATA", "APPDATA")] {
-        if let Ok(v) = std::env::var(val) {
-            result = result.replace(&format!("%{}%", key), &v);
-        }
-    }
-    result
-}
-
-/// Executes the configured action. Read-only with respect to the Dock.
-pub fn execute(config: &Config) -> Result<(), String> {
-    if !config.action.app_target.trim().is_empty() {
-        installed_apps::launch(&config.action.app_target)?;
-        if config.settings.play_confirmation_beep {
+/// Executes one button's action. Read-only with respect to the Dock.
+pub fn execute(action: &ButtonAction) -> Result<(), String> {
+    match action.kind {
+        ActionKind::None => Ok(()),
+        ActionKind::App => installed_apps::launch(&action.app_target),
+        ActionKind::Command => launch(&action.command, &action.arguments),
+        ActionKind::Sound => {
             beep();
+            Ok(())
         }
-        return Ok(());
     }
+}
 
-    // Version-1 compatibility: configs saved before AppsFolder support keep
-    // working until the user saves a registered application from the new list.
-    let preset = presets::find(&config.action.preset_id).ok_or("未知动作预设")?;
-
-    if preset.kind == "beep" {
-        beep();
-        return Ok(());
-    }
-
-    let (command, args) = if preset.id == "custom" {
-        (
-            config.action.command.clone(),
-            config.action.arguments.clone(),
-        )
-    } else {
-        (
-            resolve_executable(preset).unwrap_or_else(|| preset.command.to_string()),
-            String::new(),
-        )
-    };
-
-    launch(&command, &args)?;
-
-    if config.settings.play_confirmation_beep {
+/// Executes the action and, when the setting is on, confirms it with a sound
+/// (unless the action itself was the sound). What the backends call on press.
+pub fn run(action: &ButtonAction, settings: &Settings) -> Result<(), String> {
+    execute(action)?;
+    if settings.play_confirmation_beep
+        && !matches!(action.kind, ActionKind::None | ActionKind::Sound)
+    {
         beep();
     }
     Ok(())

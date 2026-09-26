@@ -5,6 +5,17 @@
 //! prepend it to `PATH` before invoking `winres`.
 
 fn main() {
+    // Widget style for the `slint!` macro: native-looking controls on each
+    // platform. Read by the Slint compiler through SLINT_STYLE at macro
+    // expansion, which is why it is set here and not in Cargo.toml.
+    let style = if cfg!(target_os = "macos") {
+        "cupertino"
+    } else {
+        "fluent"
+    };
+    println!("cargo:rustc-env=SLINT_STYLE={style}");
+    println!("cargo:rerun-if-changed=build.rs");
+
     #[cfg(windows)]
     {
         ensure_rc_on_path();
@@ -19,12 +30,6 @@ fn main() {
         res.set("LegalCopyright", "MIT");
         res.compile()
             .expect("failed to embed Windows resources (rc.exe)");
-    }
-
-    #[cfg(not(windows))]
-    {
-        // Nothing to do off-Windows.
-        let _ = std::env::var("CARGO_PKG_NAME");
     }
 }
 

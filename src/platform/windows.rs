@@ -43,7 +43,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::Config;
-use crate::i18n::{self, Lang};
+use crate::i18n;
 use crate::platform::MonitorEvent;
 
 // --- constants -------------------------------------------------------------
@@ -213,6 +213,11 @@ pub fn set_autostart(enable: bool, start_minimized: bool) {
     }
 }
 
+/// Raw Input is registered for the Teams collection only.
+pub fn supported_buttons() -> &'static [crate::config::Button] {
+    &[crate::config::Button::Teams]
+}
+
 pub fn autostart_enabled() -> bool {
     let sub = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
     let value = wide("MsAudioDockRemapper");
@@ -274,9 +279,8 @@ unsafe fn run(on_event: OnEvent, config: Arc<Mutex<Config>>) {
     let (action_tx, action_rx) = mpsc::channel::<Config>();
     let _action_worker = std::thread::spawn(move || {
         while let Ok(cfg) = action_rx.recv() {
-            if let Err(e) = crate::actions::execute(&cfg) {
-                let lang = Lang::resolve(&cfg.language);
-                crate::platform::alert(&format!("{} {e}", i18n::t(lang, "action_fail")));
+            if let Err(e) = crate::actions::run(&cfg.buttons.teams, &cfg.settings) {
+                crate::platform::alert(&format!("{} {e}", i18n::t("action_fail")));
             }
         }
     });
@@ -356,7 +360,7 @@ unsafe fn handle_raw_input(ctx: &mut Ctx, hrawinput: HRAWINPUT) {
     for r in &reports {
         if let Some(is_release) = match_teams(&dev, r, &cfg.device) {
             if !is_release {
-                (ctx.on_event)(MonitorEvent::Press);
+                (ctx.on_event)(MonitorEvent::Press(crate::config::Button::Teams));
                 if cfg.settings.enabled {
                     let _ = ctx.action_tx.send(cfg.clone());
                 }

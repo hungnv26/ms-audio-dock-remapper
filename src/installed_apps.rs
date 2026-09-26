@@ -435,87 +435,9 @@ pub fn launch(_target: &str) -> Result<(), String> {
     Err("Registered application launching is only available on Windows and macOS".into())
 }
 
-/// Finds the best initial selection without silently losing an existing target.
-/// Version-1 preset ids are used only as a one-time migration hint.
-pub fn selected_index(
-    apps: &[InstalledApp],
-    app_target: &str,
-    app_name: &str,
-    legacy_preset_id: &str,
-) -> Option<usize> {
-    if !app_target.is_empty() {
-        if let Some(index) = apps
-            .iter()
-            .position(|app| app.target.eq_ignore_ascii_case(app_target))
-        {
-            return Some(index);
-        }
-    }
-    if !app_name.is_empty() {
-        if let Some(index) = apps
-            .iter()
-            .position(|app| app.name.eq_ignore_ascii_case(app_name))
-        {
-            return Some(index);
-        }
-    }
-
-    let legacy_name = match legacy_preset_id {
-        "teams" => "Microsoft Teams",
-        "zoom" => "Zoom",
-        "webex" => "Webex",
-        "skype" => "Skype",
-        "chatgpt_codex" => "ChatGPT",
-        "claude" => "Claude",
-        _ => "",
-    };
-    if !legacy_name.is_empty() {
-        if let Some(index) = apps.iter().position(|app| {
-            app.name
-                .to_lowercase()
-                .contains(&legacy_name.to_lowercase())
-        }) {
-            return Some(index);
-        }
-    }
-    (!apps.is_empty()).then_some(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn app(name: &str, target: &str) -> InstalledApp {
-        InstalledApp {
-            name: name.into(),
-            target: target.into(),
-            registered: true,
-            icon_rgba: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn exact_target_wins_over_name_and_legacy_hint() {
-        let apps = vec![app("Microsoft Teams", "teams"), app("Zoom", "zoom")];
-        assert_eq!(
-            selected_index(&apps, "zoom", "Microsoft Teams", "teams"),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn migrates_a_legacy_preset_by_display_name() {
-        let apps = vec![
-            app("Calculator", "calc"),
-            app("Microsoft Teams (work or school)", "teams"),
-        ];
-        assert_eq!(selected_index(&apps, "", "", "teams"), Some(1));
-    }
-
-    #[test]
-    fn empty_list_has_no_selection() {
-        assert_eq!(selected_index(&[], "", "", "teams"), None);
-    }
 
     #[cfg(target_os = "macos")]
     #[test]
